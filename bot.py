@@ -1,7 +1,7 @@
 import os
 import logging
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext
+import threading
+import telebot
 from flask import Flask
 from waitress import serve
 
@@ -24,11 +24,15 @@ def health_check():
 def health():
     return "OK"
 
-# Глобальная переменная для бота
-application = None
+# Инициализация бота
+TOKEN = os.getenv('TELEGRAM_TOKEN')
+if not TOKEN:
+    logger.error("❌ TELEGRAM_TOKEN не найден!")
+else:
+    bot = telebot.TeleBot(TOKEN)
 
-async def start(update: Update, context: CallbackContext):
-    """Обработчик команды /start"""
+@bot.message_handler(commands=['start'])
+def send_welcome(message):
     welcome_text = """
 🤖 **Бот ООПТ Вологодской области**
 
@@ -44,10 +48,10 @@ async def start(update: Update, context: CallbackContext):
 
 Задайте вопрос об ООПТ Вологодской области!
     """
-    await update.message.reply_text(welcome_text)
+    bot.reply_to(message, welcome_text)
 
-async def help_command(update: Update, context: CallbackContext):
-    """Обработчик команды /help"""
+@bot.message_handler(commands=['help'])
+def send_help(message):
     help_text = """
 📖 **Помощь по боту:**
 
@@ -61,11 +65,11 @@ async def help_command(update: Update, context: CallbackContext):
 • Опишите проблему подробно
 • Приложите фото если есть
     """
-    await update.message.reply_text(help_text)
+    bot.reply_to(message, help_text)
 
-async def handle_message(update: Update, context: CallbackContext):
-    """Обработчик текстовых сообщений"""
-    user_question = update.message.text
+@bot.message_handler(func=lambda message: True)
+def echo_all(message):
+    user_question = message.text
     answer = f"""
 🔍 **Ваш вопрос:** {user_question}
 
@@ -73,33 +77,25 @@ async def handle_message(update: Update, context: CallbackContext):
 
 *В настоящее время идет настройка интеграции с базой знаний*
     """
-    await update.message.reply_text(answer)
+    bot.reply_to(message, answer)
+
+def run_bot():
+    """Запуск бота в отдельном потоке"""
+    if TOKEN:
+        logger.info("🤖 Запуск Telegram бота...")
+        bot.infinity_polling()
+    else:
+        logger.error("❌ Не удалось запустить бота: токен не найден")
 
 def main():
     """Основная функция"""
-    TOKEN = os.getenv('TELEGRAM_TOKEN')
-    
-    if not TOKEN:
-        logger.error("❌ TELEGRAM_TOKEN не найден!")
-        return
-    
-    # Создаем приложение
-    application = Application.builder().token(TOKEN).build()
-    
-    # Добавляем обработчики
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
     # Запускаем бота в фоне
-    import threading
-    
-    def run_bot():
-        logger.info("🤖 Запуск Telegram бота...")
-        application.run_polling()
-    
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
+    if TOKEN:
+        bot_thread = threading.Thread(target=run_bot, daemon=True)
+        bot_thread.start()
+        logger.info("✅ Бот запущен в фоновом режиме")
+    else:
+        logger.error("❌ TELEGRAM_TOKEN не установлен!")
     
     # Запускаем веб-сервер
     logger.info("🌐 Запуск веб-сервера на порту 8000...")
