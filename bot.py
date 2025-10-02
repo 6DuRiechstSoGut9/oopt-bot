@@ -20,15 +20,17 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-app.route('/')(lambda: "🤖 Бот ООПТ работает!")
+
+@app.route('/')
+def home():
+    return "🤖 Бот ООПТ Вологодской области работает!"
 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY')
 
 if not TOKEN:
     logger.error("❌ TELEGRAM_TOKEN не установлен!")
-if not DEEPSEEK_API_KEY:
-    logger.warning("⚠️ DEEPSEEK_API_KEY не установлен")
+    raise ValueError("TELEGRAM_TOKEN не установлен")
 
 bot = telebot.TeleBot(TOKEN)
 
@@ -65,9 +67,6 @@ class SimpleDocumentSearch:
         documents_dir = 'documents'
         if not os.path.exists(documents_dir):
             logger.warning(f"❌ Папка {documents_dir} не найдена")
-            # Создаем папку для тестирования
-            os.makedirs(documents_dir, exist_ok=True)
-            logger.info(f"📁 Создана папка {documents_dir}")
             return
         
         self.documents = []
@@ -83,43 +82,12 @@ class SimpleDocumentSearch:
                     if text and len(text.strip()) > 10:
                         self.documents.append({
                             'file': file,
-                            'text': text,
-                            'size': len(text)
+                            'text': text
                         })
                         file_count += 1
         
         self.loaded = True
         logger.info(f"✅ Загружено документов: {file_count}")
-        
-        # Если документов нет, создаем тестовый
-        if file_count == 0:
-            self.create_sample_document()
-    
-    def create_sample_document(self):
-        """Создаем тестовый документ если нет документов"""
-        sample_text = """ООПТ Вологодской области
-
-Заказники:
-1. Вытегорский район - Верхне-Андомский (4014 га)
-2. Ежозерский (3013 га)
-3. Шимозерский (8553 га)
-
-Памятники природы:
-- Геологические памятники в Бабушкинском районе
-- Ботанические памятники в Великоустюгском районе
-
-Всего в области более 100 ООПТ регионального значения."""
-        
-        sample_path = 'documents/образец_оопт.txt'
-        with open(sample_path, 'w', encoding='utf-8') as f:
-            f.write(sample_text)
-        
-        self.documents.append({
-            'file': 'образец_оопт.txt',
-            'text': sample_text,
-            'size': len(sample_text)
-        })
-        logger.info("📝 Создан образец документа")
     
     def search_documents(self, query):
         """Простой поиск по документам"""
@@ -132,7 +100,7 @@ class SimpleDocumentSearch:
         for doc in self.documents:
             text_lower = doc['text'].lower()
             
-            # Считаем релевантность по количеству совпадающих слов
+            # Простой поиск по ключевым словам
             query_words = [word for word in query_lower.split() if len(word) > 2]
             matches = sum(1 for word in query_words if word in text_lower)
             
@@ -147,32 +115,28 @@ class SimpleDocumentSearch:
                         
                         results.append({
                             'file': doc['file'],
-                            'text': doc['text'],
                             'snippet': snippet,
-                            'score': matches,
-                            'matched_word': word
+                            'score': matches
                         })
                         break
         
         # Сортируем по релевантности
         results.sort(key=lambda x: x['score'], reverse=True)
-        return results[:2]  # Возвращаем топ-2 результата
+        return results[:2]
     
     def ask_deepseek(self, query, context):
         """Запрос к DeepSeek API"""
         if not DEEPSEEK_API_KEY:
             return "❌ API ключ DeepSeek не настроен. Добавьте DEEPSEEK_API_KEY в переменные окружения."
         
-        prompt = f"""На основе предоставленной информации об ООПТ (Особо Охраняемых Природных Территориях) Вологодской области ответь на вопрос.
+        prompt = f"""На основе информации об ООПТ Вологодской области ответь на вопрос.
 
 ИНФОРМАЦИЯ ИЗ ДОКУМЕНТОВ:
 {context}
 
 ВОПРОС: {query}
 
-Ответь максимально информативно на основе предоставленных данных. Если информации недостаточно, скажи: "В предоставленных документах нет полной информации по этому вопросу."
-
-ОТВЕТ:"""
+Ответь на основе предоставленных данных. Если информации недостаточно, сообщи об этом."""
 
         try:
             headers = {
@@ -207,99 +171,60 @@ class SimpleDocumentSearch:
                 result = response.json()
                 return result['choices'][0]['message']['content']
             else:
-                error_msg = f"Ошибка API ({response.status_code})"
-                logger.error(f"DeepSeek API error: {response.text}")
-                return f"❌ {error_msg}"
+                return f"❌ Ошибка API: {response.status_code}"
                 
         except Exception as e:
-            logger.error(f"DeepSeek request exception: {e}")
             return f"❌ Ошибка соединения: {str(e)}"
 
-# Инициализация системы поиска
+# Инициализация системы
 doc_search = SimpleDocumentSearch()
 
 def initialize_documents():
-    """Инициализация документов в отдельном потоке"""
+    """Инициализация документов"""
     logger.info("🔄 Загрузка документов...")
     doc_search.load_documents()
-    logger.info(f"✅ Загружено документов: {len(doc_search.documents)}")
+    logger.info(f"✅ Загружено: {len(doc_search.documents)} документов")
 
 # Запускаем инициализацию
 threading.Thread(target=initialize_documents, daemon=True).start()
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
-    status = "✅ Загружено" if doc_search.loaded else "🔄 Загрузка..."
-    doc_count = len(doc_search.documents)
-    
     welcome_text = f"""🤖 Бот ООПТ Вологодской области
 
-📚 Поиск по документам об Особо Охраняемых Природных Территориях
-{status} документов: {doc_count}
+📚 Документов загружено: {len(doc_search.documents)}
+💡 Задавайте вопросы об ООПТ!
 
-💡 **Примеры запросов:**
+Примеры:
 • "ООПТ Вытегорского района"
-• "Заказник Модно"
+• "Заказник Модно" 
 • "Памятники природы"
-• "Сколько всего ООПТ"
 
-🔍 Бот ищет в документах и генерирует ответы с помощью DeepSeek AI.
-
-📊 Для проверки статуса: /status
-🆘 Помощь: /help"""
+/status - статус системы"""
     
     bot.reply_to(message, welcome_text)
 
 @bot.message_handler(commands=['status'])
 def send_status(message):
-    doc_count = len(doc_search.documents)
-    status_info = f"""📊 **Статус системы:**
+    status_info = f"""📊 Статус:
 
-• Python версия: 3.13.4
-• Документы загружены: {'✅ Да' if doc_search.loaded else '🔄 Нет'}
-• Количество документов: {doc_count}
-• DeepSeek API: {'✅ Настроен' if DEEPSEEK_API_KEY else '❌ Не настроен'}
+• Документы: {len(doc_search.documents)}
+• DeepSeek: {'✅' if DEEPSEEK_API_KEY else '❌'}
+• Python: 3.13.4
 
-💡 **Готов к работе!** Задавайте вопросы об ООПТ."""
+Готов к работе!"""
     
     bot.reply_to(message, status_info)
-
-@bot.message_handler(commands=['help'])
-def send_help(message):
-    help_text = """🆘 **Помощь:**
-
-**Команды:**
-/start - начать работу
-/status - статус системы  
-/help - эта справка
-
-**Как работать:**
-1. Задавайте вопросы на русском
-2. Указывайте конкретные названия ООПТ
-3. Используйте ключевые слова
-
-**Примеры:**
-"Какие ООПТ в Вытегорском районе?"
-"Информация о Шимозерском заказнике"
-"Список памятников природы Вологодской области"
-
-📚 Бот работает с документами в папке 'documents'"""
-    
-    bot.reply_to(message, help_text)
 
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
     bot.send_chat_action(message.chat.id, 'typing')
     
     if not doc_search.loaded:
-        bot.reply_to(message, "🔄 Документы загружаются... Попробуйте через 10 секунд.")
+        bot.reply_to(message, "🔄 Загрузка документов...")
         return
     
     user_query = message.text.strip()
-    
-    if len(user_query) < 2:
-        bot.reply_to(message, "❌ Слишком короткий запрос.")
-        return
     
     # Ищем в документах
     search_results = doc_search.search_documents(user_query)
@@ -307,7 +232,7 @@ def handle_message(message):
     if search_results:
         # Собираем контекст
         context = "\n\n".join([
-            f"Документ: {result['file']}\nФрагмент: {result['snippet']}..." 
+            f"Из {result['file']}:\n{result['snippet']}..." 
             for result in search_results
         ])
         
@@ -319,33 +244,13 @@ def handle_message(message):
         full_answer = f"{answer}\n\n📚 Источники: {sources}"
         
     else:
-        full_answer = f"""❌ По запросу "{user_query}" не найдено информации.
-
-💡 **Попробуйте:**
-• Другие формулировки
-• Конкретные названия ООПТ
-• Районы Вологодской области
-
-📋 Используйте /help для справки."""
+        full_answer = f"❌ По запросу '{user_query}' не найдено информации в документах."
     
-    # Отправляем ответ
-    try:
-        bot.reply_to(message, full_answer)
-    except Exception as e:
-        logger.error(f"Error sending message: {e}")
-        bot.reply_to(message, "❌ Ошибка при отправке ответа.")
+    bot.reply_to(message, full_answer)
 
 def main():
-    """Основная функция запуска"""
     logger.info("🚀 Запуск бота на Python 3.13.4...")
-    
-    # Запускаем бота в отдельном потоке
-    bot_thread = threading.Thread(target=bot.infinity_polling, daemon=True)
-    bot_thread.start()
-    
-    logger.info("✅ Бот запущен. Запускаем веб-сервер...")
-    
-    # Запускаем веб-сервер
+    threading.Thread(target=bot.infinity_polling, daemon=True).start()
     serve(app, host='0.0.0.0', port=8000)
 
 if __name__ == '__main__':
