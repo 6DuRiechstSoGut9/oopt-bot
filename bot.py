@@ -109,11 +109,6 @@ class SimpleDocumentSearch:
             self.loaded = True
             logger.info(f"🎉 Загрузка завершена! Найдено документов: {file_count}")
             
-            # Логируем найденные папки и файлы
-            if self.documents:
-                folders = set(os.path.dirname(doc['path']) for doc in self.documents)
-                logger.info(f"📁 Найдены папки с документами: {list(folders)}")
-            
         except Exception as e:
             self.error = str(e)
             logger.error(f"❌ Ошибка загрузки документов: {e}")
@@ -140,14 +135,15 @@ class SimpleDocumentSearch:
                 for word in query_words:
                     if word in text_lower:
                         index = text_lower.find(word)
-                        start = max(0, index - 50)
-                        end = min(len(doc['text']), index + 150)
+                        start = max(0, index - 100)
+                        end = min(len(doc['text']), index + 300)
                         snippet = doc['text'][start:end]
                         
                         results.append({
                             'file': doc['file'],
                             'path': doc['path'],
                             'snippet': snippet,
+                            'full_text': doc['text'],
                             'score': matches
                         })
                         break
@@ -159,7 +155,7 @@ class SimpleDocumentSearch:
     def ask_deepseek(self, query, context):
         """Запрос к DeepSeek API"""
         if not DEEPSEEK_API_KEY:
-            return "❌ API ключ DeepSeek не настроен. Добавьте DEEPSEEK_API_KEY в переменные окружения."
+            return None, "❌ API ключ DeepSeek не настроен."
         
         prompt = f"""На основе информации об ООПТ Вологодской области ответь на вопрос.
 
@@ -201,12 +197,44 @@ class SimpleDocumentSearch:
             
             if response.status_code == 200:
                 result = response.json()
-                return result['choices'][0]['message']['content']
+                return result['choices'][0]['message']['content'], None
             else:
-                return f"❌ Ошибка API: {response.status_code}"
+                return None, f"❌ Ошибка API: {response.status_code}"
                 
         except Exception as e:
-            return f"❌ Ошибка соединения: {str(e)}"
+            return None, f"❌ Ошибка соединения: {str(e)}"
+    
+    def generate_simple_answer(self, query, search_results):
+        """Генерация простого ответа без DeepSeek"""
+        if not search_results:
+            return "❌ Не найдено информации по вашему запросу."
+        
+        # Собираем наиболее релевантные фрагменты
+        answer_parts = []
+        
+        for result in search_results:
+            # Находим наиболее релевантный фрагмент
+            text_lower = result['full_text'].lower()
+            query_words = [word for word in query.lower().split() if len(word) > 2]
+            
+            # Ищем предложения с ключевыми словами
+            sentences = result['full_text'].split('. ')
+            relevant_sentences = []
+            
+            for sentence in sentences:
+                if any(word in sentence.lower() for word in query_words):
+                    relevant_sentences.append(sentence.strip())
+            
+            if relevant_sentences:
+                file_info = f"**Из {result['file']}:**"
+                content = ". ".join(relevant_sentences[:3]) + "."
+                answer_parts.append(f"{file_info}\n{content}")
+        
+        if answer_parts:
+            answer = "\n\n".join(answer_parts)
+            return f"📚 Найдена информация по запросу '{query}':\n\n{answer}"
+        else:
+            return f"❌ В документах есть информация по теме '{query}', но не удалось выделить конкретный ответ."
 
 # Инициализация системы
 doc_search = SimpleDocumentSearch()
@@ -239,20 +267,25 @@ def send_welcome(message):
     else:
         status_msg = "🔄 Статус неизвестен"
     
+    deepseek_status = "✅ DeepSeek доступен" if DEEPSEEK_API_KEY else "❌ DeepSeek не настроен"
+    
     welcome_text = f"""🤖 Бот ООПТ Вологодской области
 
 {status_msg}
+{deepseek_status}
 
-💡 Задавайте вопросы об ООПТ!
+💡 **Режимы работы:**
+• С DeepSeek - интеллектуальные ответы
+• Без DeepSeek - поиск по документам
 
-Примеры:
-• "ООПТ Вытегорского района"
-• "Заказник Модно" 
+**Примеры запросов:**
+• "Заповедники Вологодской области"
+• "ООПТ Вытегорского района" 
 • "Памятники природы"
-• "Сколько всего ООПТ"
 
 /status - подробный статус
-/files - список найденных файлов"""
+/files - список документов
+/mode - текущий режим работы"""
     
     bot.reply_to(message, welcome_text)
 
@@ -261,15 +294,12 @@ def send_status(message):
     if doc_search.loading:
         status_text = "🔄 **Идет поиск документов...**\nПожалуйста, подождите."
     elif doc_search.loaded:
-        # Собираем информацию о папках
-        folders = set(os.path.dirname(doc['path']) for doc in doc_search.documents)
-        
         status_text = f"""✅ **Система готова к работе!**
 
 • Найдено документов: {len(doc_search.documents)}
-• Папки с документами: {len(folders)}
 • Общий объем текста: {sum(doc['size'] for doc in doc_search.documents)} символов
-• DeepSeek API: {'✅ Настроен' if DEEPSEEK_API_KEY else '❌ Не настроен'}"""
+• DeepSeek API: {'✅ Настроен' if DEEPSEEK_API_KEY else '❌ Не настроен'}
+• Режим работы: {'🤖 С DeepSeek' if DEEPSEEK_API_KEY else '📚 Только поиск'}"""
     elif doc_search.error:
         status_text = f"""❌ **Ошибка загрузки**
 
@@ -278,6 +308,20 @@ def send_status(message):
         status_text = "⚪ **Статус неизвестен**\nПопробуйте перезапустить бота."
     
     bot.reply_to(message, status_text)
+
+@bot.message_handler(commands=['mode'])
+def show_mode(message):
+    """Показать текущий режим работы"""
+    if DEEPSEEK_API_KEY:
+        mode_text = """🤖 **Режим: С DeepSeek**
+
+Бот использует DeepSeek AI для генерации интеллектуальных ответов на основе найденных документов."""
+    else:
+        mode_text = """📚 **Режим: Только поиск**
+
+Бот ищет информацию в документах и показывает найденные фрагменты."""
+    
+    bot.reply_to(message, mode_text)
 
 @bot.message_handler(commands=['files'])
 def list_files(message):
@@ -292,48 +336,16 @@ def list_files(message):
     
     files_text = "📁 **Найденные документы:**\n\n"
     
-    # Группируем по папкам
-    folders = {}
-    for doc in doc_search.documents:
-        folder = os.path.dirname(doc['path'])
-        if folder not in folders:
-            folders[folder] = []
-        folders[folder].append(doc)
+    # Показываем только первые 10 файлов чтобы не перегружать
+    for doc in doc_search.documents[:10]:
+        files_text += f"• {doc['file']} ({doc['size']} символов)\n"
     
-    for folder, docs in folders.items():
-        files_text += f"📂 **{folder or 'Корневая папка'}**\n"
-        for doc in docs:
-            files_text += f"• {doc['file']} ({doc['size']} символов)\n"
-        files_text += "\n"
+    if len(doc_search.documents) > 10:
+        files_text += f"\n... и еще {len(doc_search.documents) - 10} файлов"
     
-    files_text += f"Всего: {len(doc_search.documents)} документов"
+    files_text += f"\n\nВсего: {len(doc_search.documents)} документов"
     
-    # Если слишком длинное сообщение, разбиваем
-    if len(files_text) > 4000:
-        parts = [files_text[i:i+4000] for i in range(0, len(files_text), 4000)]
-        for part in parts:
-            bot.reply_to(message, part)
-    else:
-        bot.reply_to(message, files_text)
-
-@bot.message_handler(commands=['reload'])
-def reload_documents(message):
-    """Команда для перезагрузки документов"""
-    if doc_search.loading:
-        bot.reply_to(message, "🔄 Документы уже загружаются. Дождитесь завершения.")
-        return
-    
-    bot.reply_to(message, "🔄 Перезагружаем документы...")
-    
-    # Запускаем перезагрузку в отдельном потоке
-    def reload():
-        doc_search.load_documents()
-        if doc_search.loaded:
-            bot.reply_to(message, f"✅ Перезагрузка завершена! Найдено документов: {len(doc_search.documents)}")
-        else:
-            bot.reply_to(message, f"❌ Ошибка перезагрузки: {doc_search.error}")
-    
-    threading.Thread(target=reload, daemon=True).start()
+    bot.reply_to(message, files_text)
 
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
@@ -346,9 +358,9 @@ def handle_message(message):
     
     if not doc_search.loaded:
         if doc_search.error:
-            bot.reply_to(message, f"❌ Ошибка загрузки документов: {doc_search.error}\nИспользуйте /reload для повторной попытки.")
+            bot.reply_to(message, f"❌ Ошибка загрузки документов: {doc_search.error}")
         else:
-            bot.reply_to(message, "❌ Документы не загружены. Используйте /reload для загрузки.")
+            bot.reply_to(message, "❌ Документы не загружены.")
         return
     
     user_query = message.text.strip()
@@ -360,31 +372,39 @@ def handle_message(message):
     # Ищем в документах
     search_results = doc_search.search_documents(user_query)
     
-    if search_results:
+    if not search_results:
+        answer = f"❌ По запросу '{user_query}' не найдено информации в документах."
+        bot.reply_to(message, answer)
+        return
+    
+    # Пробуем использовать DeepSeek если доступен
+    if DEEPSEEK_API_KEY:
         # Собираем контекст
         context = "\n\n".join([
             f"Из {result['file']}:\n{result['snippet']}..." 
             for result in search_results
         ])
         
-        # Генерируем ответ
-        answer = doc_search.ask_deepseek(user_query, context)
+        # Генерируем ответ через DeepSeek
+        deepseek_answer, error = doc_search.ask_deepseek(user_query, context)
         
-        # Добавляем источники
-        sources = ", ".join(set(result['file'] for result in search_results))
-        full_answer = f"{answer}\n\n📚 Источники: {sources}"
-        
+        if deepseek_answer:
+            # Успешный ответ от DeepSeek
+            sources = ", ".join(set(result['file'] for result in search_results))
+            full_answer = f"{deepseek_answer}\n\n📚 Источники: {sources}"
+        else:
+            # Ошибка DeepSeek - используем простой режим
+            logger.warning(f"DeepSeek ошибка: {error}")
+            simple_answer = doc_search.generate_simple_answer(user_query, search_results)
+            sources = ", ".join(set(result['file'] for result in search_results))
+            full_answer = f"🤖 Не удалось получить ответ от AI\n\n{simple_answer}\n\n📚 Источники: {sources}"
     else:
-        full_answer = f"""❌ По запросу '{user_query}' не найдено информации в документах.
-
-💡 Попробуйте:
-• Использовать другие ключевые слова
-• Указать конкретное название ООПТ
-• Уточнить район расположения
-
-📋 Используйте /files чтобы посмотреть список доступных документов"""
+        # Режим без DeepSeek
+        simple_answer = doc_search.generate_simple_answer(user_query, search_results)
+        sources = ", ".join(set(result['file'] for result in search_results))
+        full_answer = f"{simple_answer}\n\n📚 Источники: {sources}"
     
-    # Отправляем ответ (разбиваем если слишком длинный)
+    # Отправляем ответ
     try:
         if len(full_answer) > 4000:
             parts = [full_answer[i:i+4000] for i in range(0, len(full_answer), 4000)]
@@ -401,7 +421,7 @@ def main():
     
     # Даем время на начальную загрузку документов
     logger.info("⏳ Ожидаем завершения начальной загрузки документов...")
-    for i in range(30):  # Ждем до 30 секунд
+    for i in range(30):
         if doc_search.loaded or doc_search.error:
             break
         time.sleep(1)
