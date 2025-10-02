@@ -10,6 +10,7 @@ import requests
 import PyPDF2
 import docx
 import re
+from datetime import datetime, timedelta
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -35,6 +36,9 @@ if not TOKEN:
     raise ValueError("TELEGRAM_TOKEN не установлен")
 
 bot = telebot.TeleBot(TOKEN)
+
+# Простая система контекста
+user_context = {}
 
 class SimpleDocumentSearch:
     def __init__(self):
@@ -360,6 +364,44 @@ logger.info("🚀 Запуск инициализации документов..
 doc_thread = threading.Thread(target=initialize_documents, daemon=True)
 doc_thread.start()
 
+def get_user_context(user_id):
+    """Получить контекст пользователя"""
+    now = datetime.now()
+    if user_id in user_context:
+        # Удаляем старый контекст (старше 10 минут)
+        if now - user_context[user_id]['timestamp'] > timedelta(minutes=10):
+            del user_context[user_id]
+            return None
+        return user_context[user_id]
+    return None
+
+def update_user_context(user_id, query, results):
+    """Обновить контекст пользователя"""
+    user_context[user_id] = {
+        'last_query': query,
+        'last_results': results,
+        'timestamp': datetime.now()
+    }
+
+def handle_context_query(user_id, current_query):
+    """Обработка контекстных запросов"""
+    context = get_user_context(user_id)
+    if not context:
+        return current_query, None
+    
+    last_query = context['last_query']
+    
+    # Распознаем контекстные запросы
+    context_phrases = [
+        'еще', 'еще раз', 'повтори', 'расскажи еще', 'продолжи', 
+        'дальше', 'следующие', 'покажи еще', 'еще информации'
+    ]
+    
+    if any(phrase in current_query.lower() for phrase in context_phrases):
+        return last_query, context['last_results']
+    
+    return current_query, None
+
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     welcome_text = """🤖 Бот ООПТ Вологодской области
@@ -370,12 +412,14 @@ def send_welcome(message):
 • Задавайте вопросы на естественном языке
 • Используйте конкретные названия ООПТ
 • Указывайте районы Вологодской области
+• Можно сказать "еще" или "повтори" для продолжения
 
 💡 **Примеры запросов:**
 • "Заповедники и заказники"
 • "ООПТ Вытегорского района" 
 • "Памятники природы"
 • "Сколько всего охраняемых территорий"
+• "еще" - повторить последний запрос
 
 📋 **Команды:**
 /start или /help - эта справка
@@ -418,7 +462,10 @@ def show_mode(message):
 Бот анализирует документы и предоставляет структурированную информацию:
 • Основные сведения об ООПТ
 • Расположение и районы
-• Статистику и общую информацию"""
+• Статистику и общую информацию
+
+💡 **Контекст:** Бот запоминает последний запрос на 10 минут.
+Можно сказать "еще" или "повтори" для продолжения."""
     
     bot.reply_to(message, mode_text)
 
@@ -480,18 +527,32 @@ def handle_message(message):
         return
     
     user_query = message.text.strip()
+    user_id = message.from_user.id
     
     if len(user_query) < 2:
         bot.reply_to(message, "❌ Слишком короткий запрос.")
         return
     
-    # Ищем в документах
-    search_results = doc_search.search_documents(user_query)
+    # Проверяем контекстные запросы
+    effective_query, cached_results = handle_context_query(user_id, user_query)
+    
+    if cached_results:
+        # Используем кэшированные результаты
+        search_results = cached_results
+        user_query = effective_query
+        answer_note = "🔄 *Повторяю предыдущий запрос:*\n\n"
+    else:
+        # Выполняем новый поиск
+        search_results = doc_search.search_documents(effective_query)
+        answer_note = ""
     
     if not search_results:
-        answer = doc_search.get_no_results_message(user_query)
+        answer = doc_search.get_no_results_message(effective_query)
         bot.reply_to(message, answer)
         return
+    
+    # Сохраняем контекст для будущих запросов
+    update_user_context(user_id, effective_query, search_results)
     
     # Пробуем использовать DeepSeek если доступен
     if DEEPSEEK_API_KEY:
@@ -502,23 +563,23 @@ def handle_message(message):
         ])
         
         # Генерируем ответ через DeepSeek
-        deepseek_answer, error = doc_search.ask_deepseek(user_query, context)
+        deepseek_answer, error = doc_search.ask_deepseek(effective_query, context)
         
         if deepseek_answer:
             # Успешный ответ от DeepSeek
             sources = ", ".join(set(result['file'] for result in search_results))
-            full_answer = f"{deepseek_answer}\n\n📚 Источники: {sources}"
+            full_answer = f"{answer_note}{deepseek_answer}\n\n📚 Источники: {sources}"
         else:
             # Ошибка DeepSeek - используем умный поиск
             logger.warning(f"DeepSeek ошибка: {error}")
-            simple_answer = doc_search.generate_simple_answer(user_query, search_results)
+            simple_answer = doc_search.generate_simple_answer(effective_query, search_results)
             sources = ", ".join(set(result['file'] for result in search_results))
-            full_answer = f"{simple_answer}\n\n📚 Источники: {sources}"
+            full_answer = f"{answer_note}{simple_answer}\n\n📚 Источники: {sources}"
     else:
         # Режим умного поиска
-        simple_answer = doc_search.generate_simple_answer(user_query, search_results)
+        simple_answer = doc_search.generate_simple_answer(effective_query, search_results)
         sources = ", ".join(set(result['file'] for result in search_results))
-        full_answer = f"{simple_answer}\n\n📚 Источники: {sources}"
+        full_answer = f"{answer_note}{simple_answer}\n\n📚 Источники: {sources}"
     
     # Отправляем ответ
     try:
