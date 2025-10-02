@@ -11,6 +11,8 @@ logging.basicConfig(
     level=logging.INFO
 )
 
+logger = logging.getLogger(__name__)
+
 # Flask app для health checks
 app = Flask(__name__)
 
@@ -73,15 +75,15 @@ async def handle_message(update: Update, context: CallbackContext):
     """
     await update.message.reply_text(answer)
 
-def setup_bot():
-    """Настройка бота"""
-    global application
+def main():
+    """Основная функция"""
     TOKEN = os.getenv('TELEGRAM_TOKEN')
     
     if not TOKEN:
-        print("❌ Ошибка: TELEGRAM_TOKEN не найден!")
-        return None
+        logger.error("❌ TELEGRAM_TOKEN не найден!")
+        return
     
+    # Создаем приложение
     application = Application.builder().token(TOKEN).build()
     
     # Добавляем обработчики
@@ -89,26 +91,19 @@ def setup_bot():
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    return application
-
-if __name__ == '__main__':
-    print("🚀 Запуск бота ООПТ...")
+    # Запускаем бота в фоне
+    import threading
     
-    # Настраиваем бота
-    bot = setup_bot()
+    def run_bot():
+        logger.info("🤖 Запуск Telegram бота...")
+        application.run_polling()
     
-    if bot:
-        # Запускаем бота в фоне
-        import threading
-        
-        def run_bot():
-            print("🤖 Запуск Telegram бота...")
-            bot.run_polling()
-        
-        bot_thread = threading.Thread(target=run_bot)
-        bot_thread.daemon = True
-        bot_thread.start()
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    bot_thread.start()
     
     # Запускаем веб-сервер
-    print("🌐 Запуск веб-сервера на порту 8000...")
+    logger.info("🌐 Запуск веб-сервера на порту 8000...")
     serve(app, host='0.0.0.0', port=8000)
+
+if __name__ == '__main__':
+    main()
