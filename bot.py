@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 import requests
 import PyPDF2
 import docx
+import re
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -116,41 +117,60 @@ class SimpleDocumentSearch:
             self.loading = False
     
     def search_documents(self, query):
-        """Простой поиск по документам"""
+        """Умный поиск по документам"""
         if not self.loaded or not self.documents:
             return []
         
         query_lower = query.lower()
         results = []
         
+        # Ключевые слова для поиска
+        keywords = [word for word in query_lower.split() if len(word) > 2]
+        
         for doc in self.documents:
             text_lower = doc['text'].lower()
             
-            # Простой поиск по ключевым словам
-            query_words = [word for word in query_lower.split() if len(word) > 2]
-            matches = sum(1 for word in query_words if word in text_lower)
+            # Ищем совпадения ключевых слов
+            matches = sum(1 for word in keywords if word in text_lower)
             
             if matches > 0:
-                # Находим фрагмент с совпадением
-                for word in query_words:
-                    if word in text_lower:
-                        index = text_lower.find(word)
-                        start = max(0, index - 100)
-                        end = min(len(doc['text']), index + 300)
-                        snippet = doc['text'][start:end]
-                        
-                        results.append({
-                            'file': doc['file'],
-                            'path': doc['path'],
-                            'snippet': snippet,
-                            'full_text': doc['text'],
-                            'score': matches
-                        })
-                        break
+                # Находим наиболее релевантный фрагмент
+                best_snippet = self.extract_best_snippet(doc['text'], keywords)
+                
+                results.append({
+                    'file': doc['file'],
+                    'path': doc['path'],
+                    'snippet': best_snippet,
+                    'full_text': doc['text'],
+                    'score': matches
+                })
         
         # Сортируем по релевантности
         results.sort(key=lambda x: x['score'], reverse=True)
         return results[:3]
+    
+    def extract_best_snippet(self, text, keywords):
+        """Извлекает наиболее релевантный фрагмент текста"""
+        sentences = re.split(r'[.!?]+', text)
+        relevant_sentences = []
+        
+        for sentence in sentences:
+            sentence_clean = sentence.strip()
+            if len(sentence_clean) < 10:
+                continue
+                
+            # Проверяем релевантность предложения
+            sentence_lower = sentence_clean.lower()
+            relevance = sum(1 for keyword in keywords if keyword in sentence_lower)
+            
+            if relevance > 0:
+                relevant_sentences.append((sentence_clean, relevance))
+        
+        # Сортируем по релевантности и берем топ-3 предложения
+        relevant_sentences.sort(key=lambda x: x[1], reverse=True)
+        best_sentences = [sentence for sentence, _ in relevant_sentences[:3]]
+        
+        return ". ".join(best_sentences) + "."
     
     def ask_deepseek(self, query, context):
         """Запрос к DeepSeek API"""
@@ -205,36 +225,120 @@ class SimpleDocumentSearch:
             return None, f"❌ Ошибка соединения: {str(e)}"
     
     def generate_simple_answer(self, query, search_results):
-        """Генерация простого ответа без DeepSeek"""
+        """Генерация структурированного ответа без DeepSeek"""
         if not search_results:
-            return "❌ Не найдено информации по вашему запросу."
+            return self.get_no_results_message(query)
         
-        # Собираем наиболее релевантные фрагменты
-        answer_parts = []
+        # Анализируем тип запроса
+        query_lower = query.lower()
+        
+        if any(word in query_lower for word in ['заповедник', 'заказник', 'оопт', 'территори']):
+            return self.generate_oopts_info(query, search_results)
+        elif any(word in query_lower for word in ['район', 'местоположен', 'где']):
+            return self.generate_location_info(query, search_results)
+        elif any(word in query_lower for word in ['сколько', 'количество', 'число']):
+            return self.generate_count_info(query, search_results)
+        else:
+            return self.generate_general_info(query, search_results)
+    
+    def generate_oopts_info(self, query, search_results):
+        """Генерация информации об ООПТ"""
+        answer_parts = ["🌿 **Информация об ООПТ Вологодской области:**\n"]
         
         for result in search_results:
-            # Находим наиболее релевантный фрагмент
-            text_lower = result['full_text'].lower()
-            query_words = [word for word in query.lower().split() if len(word) > 2]
+            file_name = result['file'].replace('.docx', '').replace('.pdf', '').replace('.txt', '')
             
-            # Ищем предложения с ключевыми словами
-            sentences = result['full_text'].split('. ')
-            relevant_sentences = []
+            # Извлекаем основную информацию из текста
+            text = result['full_text']
             
-            for sentence in sentences:
-                if any(word in sentence.lower() for word in query_words):
-                    relevant_sentences.append(sentence.strip())
+            # Ищем профиль
+            profile_match = re.search(r'Профиль\s*[—–:-]?\s*(.*?)(?:\n|$)', text, re.IGNORECASE)
+            profile = profile_match.group(1).strip() if profile_match else "не указан"
             
-            if relevant_sentences:
-                file_info = f"**Из {result['file']}:**"
-                content = ". ".join(relevant_sentences[:3]) + "."
-                answer_parts.append(f"{file_info}\n{content}")
+            # Ищем цели создания
+            goals_match = re.search(r'Цели? создания?.*?[—–:-]?\s*(.*?)(?:\n|\.|$)', text, re.IGNORECASE)
+            goals = goals_match.group(1).strip() if goals_match else "не указаны"
+            
+            # Ищем ограничения
+            restrictions_match = re.search(r'запрещаются.*?:(.*?)(?:\n\n|\n\s*\n|$)', text, re.DOTALL)
+            restrictions = restrictions_match.group(1).strip()[:200] + "..." if restrictions_match else "стандартный режим охраны"
+            
+            info = f"""**📋 {file_name}**
+• **Профиль:** {profile}
+• **Цели:** {goals[:100]}...
+• **Ограничения:** {restrictions}"""
+
+            answer_parts.append(info)
         
-        if answer_parts:
-            answer = "\n\n".join(answer_parts)
-            return f"📚 Найдена информация по запросу '{query}':\n\n{answer}"
-        else:
-            return f"❌ В документах есть информация по теме '{query}', но не удалось выделить конкретный ответ."
+        answer_parts.append(f"\n📚 *На основе анализа {len(search_results)} документов*")
+        return "\n\n".join(answer_parts)
+    
+    def generate_location_info(self, query, search_results):
+        """Генерация информации о расположении"""
+        answer_parts = ["🗺️ **Расположение ООПТ:**\n"]
+        
+        for result in search_results:
+            file_name = result['file'].replace('.docx', '').replace('.pdf', '').replace('.txt', '')
+            text = result['full_text']
+            
+            # Ищем упоминания районов
+            districts = []
+            common_districts = ['Вытегорский', 'Вологодский', 'Череповецкий', 'Великоустюгский', 
+                              'Бабаевский', 'Кирилловский', 'Шекснинский', 'Устюженский']
+            
+            for district in common_districts:
+                if district.lower() in text.lower():
+                    districts.append(district)
+            
+            location_info = f"**{file_name}**"
+            if districts:
+                location_info += f" - расположен в {', '.join(districts)} районе"
+            else:
+                location_info += " - район расположения не указан"
+            
+            answer_parts.append(location_info)
+        
+        return "\n• ".join(answer_parts)
+    
+    def generate_count_info(self, query, search_results):
+        """Генерация информации о количестве"""
+        total_docs = len(self.documents)
+        return f"""📊 **Статистика ООПТ:**
+
+• Обработано документов: {total_docs}
+• Найдено упоминаний по вашему запросу: {len(search_results)}
+• Общий объем информации: {sum(doc['size'] for doc in self.documents):,} символов
+
+💡 *Для точной статистики используйте конкретные названия ООПТ*"""
+    
+    def generate_general_info(self, query, search_results):
+        """Генерация общей информации"""
+        answer_parts = [f"🔍 **Результаты по запросу '{query}':**\n"]
+        
+        for i, result in enumerate(search_results, 1):
+            file_name = result['file'].replace('.docx', '').replace('.pdf', '').replace('.txt', '')
+            snippet = result['snippet']
+            
+            # Обрезаем слишком длинные сниппеты
+            if len(snippet) > 300:
+                snippet = snippet[:300] + "..."
+            
+            answer_parts.append(f"{i}. **{file_name}**\n{snippet}")
+        
+        return "\n\n".join(answer_parts)
+    
+    def get_no_results_message(self, query):
+        """Сообщение когда ничего не найдено"""
+        return f"""❌ По запросу "{query}" не найдено информации.
+
+💡 **Советы для поиска:**
+• Используйте конкретные названия ООПТ
+• Указывайте районы Вологодской области  
+• Попробуйте: "заказники", "памятники природы", "Вытегорский район"
+
+📋 **Доступные команды:**
+/files - список всех документов
+/help - справка по использованию"""
 
 # Инициализация системы
 doc_search = SimpleDocumentSearch()
@@ -256,37 +360,29 @@ logger.info("🚀 Запуск инициализации документов..
 doc_thread = threading.Thread(target=initialize_documents, daemon=True)
 doc_thread.start()
 
-@bot.message_handler(commands=['start'])
+@bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    if doc_search.loading:
-        status_msg = "🔄 Поиск документов..."
-    elif doc_search.loaded:
-        status_msg = f"✅ Найдено документов: {len(doc_search.documents)}"
-    elif doc_search.error:
-        status_msg = f"❌ Ошибка: {doc_search.error}"
-    else:
-        status_msg = "🔄 Статус неизвестен"
-    
-    deepseek_status = "✅ DeepSeek доступен" if DEEPSEEK_API_KEY else "❌ DeepSeek не настроен"
-    
-    welcome_text = f"""🤖 Бот ООПТ Вологодской области
+    welcome_text = """🤖 Бот ООПТ Вологодской области
 
-{status_msg}
-{deepseek_status}
+📚 **Интеллектуальный поиск по документам об Особо Охраняемых Природных Территориях**
 
-💡 **Режимы работы:**
-• С DeepSeek - интеллектуальные ответы
-• Без DeepSeek - поиск по документам
+🔍 **Как работать с ботом:**
+• Задавайте вопросы на естественном языке
+• Используйте конкретные названия ООПТ
+• Указывайте районы Вологодской области
 
-**Примеры запросов:**
-• "Заповедники Вологодской области"
+💡 **Примеры запросов:**
+• "Заповедники и заказники"
 • "ООПТ Вытегорского района" 
 • "Памятники природы"
+• "Сколько всего охраняемых территорий"
 
-/status - подробный статус
+📋 **Команды:**
+/start или /help - эта справка
+/status - статус системы
 /files - список документов
-/mode - текущий режим работы"""
-    
+/mode - режим работы"""
+
     bot.reply_to(message, welcome_text)
 
 @bot.message_handler(commands=['status'])
@@ -297,15 +393,15 @@ def send_status(message):
         status_text = f"""✅ **Система готова к работе!**
 
 • Найдено документов: {len(doc_search.documents)}
-• Общий объем текста: {sum(doc['size'] for doc in doc_search.documents)} символов
+• Общий объем текста: {sum(doc['size'] for doc in doc_search.documents):,} символов
 • DeepSeek API: {'✅ Настроен' if DEEPSEEK_API_KEY else '❌ Не настроен'}
-• Режим работы: {'🤖 С DeepSeek' if DEEPSEEK_API_KEY else '📚 Только поиск'}"""
+• Режим работы: {'🤖 С DeepSeek' if DEEPSEEK_API_KEY else '📚 Умный поиск'}"""
     elif doc_search.error:
         status_text = f"""❌ **Ошибка загрузки**
 
 • Ошибка: {doc_search.error}"""
     else:
-        status_text = "⚪ **Статус неизвестен**\nПопробуйте перезапустить бота."
+        status_text = "⚪ **Статус неизвестен**"
     
     bot.reply_to(message, status_text)
 
@@ -317,9 +413,12 @@ def show_mode(message):
 
 Бот использует DeepSeek AI для генерации интеллектуальных ответов на основе найденных документов."""
     else:
-        mode_text = """📚 **Режим: Только поиск**
+        mode_text = """📚 **Режим: Умный поиск**
 
-Бот ищет информацию в документах и показывает найденные фрагменты."""
+Бот анализирует документы и предоставляет структурированную информацию:
+• Основные сведения об ООПТ
+• Расположение и районы
+• Статистику и общую информацию"""
     
     bot.reply_to(message, mode_text)
 
@@ -336,14 +435,31 @@ def list_files(message):
     
     files_text = "📁 **Найденные документы:**\n\n"
     
-    # Показываем только первые 10 файлов чтобы не перегружать
-    for doc in doc_search.documents[:10]:
-        files_text += f"• {doc['file']} ({doc['size']} символов)\n"
+    # Группируем по первым цифрам (предполагая что это номера ООПТ)
+    grouped_files = {}
+    for doc in doc_search.documents:
+        # Извлекаем номер из названия файла
+        match = re.match(r'(\d+)', doc['file'])
+        if match:
+            prefix = match.group(1)
+        else:
+            prefix = '其他'
+        
+        if prefix not in grouped_files:
+            grouped_files[prefix] = []
+        grouped_files[prefix].append(doc)
     
-    if len(doc_search.documents) > 10:
-        files_text += f"\n... и еще {len(doc_search.documents) - 10} файлов"
+    # Сортируем по номерам
+    for prefix in sorted(grouped_files.keys(), key=lambda x: int(x) if x.isdigit() else 999):
+        files = grouped_files[prefix]
+        files_text += f"**{prefix}xx:**\n"
+        for doc in files[:5]:  # Показываем первые 5 файлов каждой группы
+            files_text += f"• {doc['file']} ({doc['size']:,} символов)\n"
+        if len(files) > 5:
+            files_text += f"  ... и еще {len(files) - 5} файлов\n"
+        files_text += "\n"
     
-    files_text += f"\n\nВсего: {len(doc_search.documents)} документов"
+    files_text += f"📊 Всего: {len(doc_search.documents)} документов"
     
     bot.reply_to(message, files_text)
 
@@ -373,7 +489,7 @@ def handle_message(message):
     search_results = doc_search.search_documents(user_query)
     
     if not search_results:
-        answer = f"❌ По запросу '{user_query}' не найдено информации в документах."
+        answer = doc_search.get_no_results_message(user_query)
         bot.reply_to(message, answer)
         return
     
@@ -381,7 +497,7 @@ def handle_message(message):
     if DEEPSEEK_API_KEY:
         # Собираем контекст
         context = "\n\n".join([
-            f"Из {result['file']}:\n{result['snippet']}..." 
+            f"Из {result['file']}:\n{result['snippet']}" 
             for result in search_results
         ])
         
@@ -393,13 +509,13 @@ def handle_message(message):
             sources = ", ".join(set(result['file'] for result in search_results))
             full_answer = f"{deepseek_answer}\n\n📚 Источники: {sources}"
         else:
-            # Ошибка DeepSeek - используем простой режим
+            # Ошибка DeepSeek - используем умный поиск
             logger.warning(f"DeepSeek ошибка: {error}")
             simple_answer = doc_search.generate_simple_answer(user_query, search_results)
             sources = ", ".join(set(result['file'] for result in search_results))
-            full_answer = f"🤖 Не удалось получить ответ от AI\n\n{simple_answer}\n\n📚 Источники: {sources}"
+            full_answer = f"{simple_answer}\n\n📚 Источники: {sources}"
     else:
-        # Режим без DeepSeek
+        # Режим умного поиска
         simple_answer = doc_search.generate_simple_answer(user_query, search_results)
         sources = ", ".join(set(result['file'] for result in search_results))
         full_answer = f"{simple_answer}\n\n📚 Источники: {sources}"
@@ -425,15 +541,11 @@ def main():
         if doc_search.loaded or doc_search.error:
             break
         time.sleep(1)
-        if i % 10 == 0:
-            logger.info(f"⏰ Ожидание загрузки... {i} сек")
     
     if doc_search.loaded:
         logger.info(f"🎉 Начальная загрузка завершена! Документов: {len(doc_search.documents)}")
     elif doc_search.error:
         logger.error(f"❌ Ошибка начальной загрузки: {doc_search.error}")
-    else:
-        logger.warning("⚠️ Начальная загрузка не завершена, продолжаем в фоне")
     
     # Запускаем бота
     threading.Thread(target=bot.infinity_polling, daemon=True).start()
