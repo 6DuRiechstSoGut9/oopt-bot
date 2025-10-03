@@ -3,5 +3,10 @@ flask==2.3.3
 waitress==3.0.0
 python-dotenv==1.0.0
 requests==2.31.0
-PyPDF2==3.0.1
+openai==1.30.5
+sentence-transformers==2.2.2
+chromadb==0.4.22
+langchain==0.1.0
+langchain-community==0.0.10
+pypdf2==3.0.1
 python-docx==1.1.0
