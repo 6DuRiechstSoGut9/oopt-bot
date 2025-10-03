@@ -8,9 +8,9 @@ from dotenv import load_dotenv
 import requests
 import PyPDF2
 import docx
-import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
 import re
 
 # Загружаем переменные окружения
@@ -40,7 +40,7 @@ class ProfessionalDocumentSearch:
     def __init__(self):
         self.documents = []
         self.chunks = []
-        self.index = None
+        self.embeddings = None
         self.model = None
         self.loaded = False
     
@@ -138,23 +138,12 @@ class ProfessionalDocumentSearch:
                         })
                         file_count += 1
         
-        # Создаем векторный индекс с FAISS
+        # Создаем эмбеддинги для всех фрагментов
         if self.chunks and self.model:
-            logger.info(f"🔄 Создаем векторный индекс для {chunk_count} фрагментов...")
-            
-            # Создаем эмбеддинги для всех фрагментов
+            logger.info(f"🔄 Создаем эмбеддинги для {chunk_count} фрагментов...")
             chunk_texts = [chunk['text'] for chunk in self.chunks]
-            embeddings = self.model.encode(chunk_texts)
-            
-            # Создаем FAISS индекс
-            dimension = embeddings.shape[1]
-            self.index = faiss.IndexFlatIP(dimension)  # IndexFlatIP для косинусного сходства
-            
-            # Нормализуем векторы для косинусного сходства
-            faiss.normalize_L2(embeddings)
-            self.index.add(embeddings)
-            
-            logger.info(f"✅ Векторный индекс создан. Размерность: {dimension}, векторов: {self.index.ntotal}")
+            self.embeddings = self.model.encode(chunk_texts)
+            logger.info(f"✅ Эмбеддинги созданы. Размерность: {self.embeddings.shape[1]}")
         
         self.loaded = True
         logger.info(f"✅ Загружено документов: {file_count}, фрагментов: {chunk_count}")
@@ -182,26 +171,28 @@ class ProfessionalDocumentSearch:
         logger.info("📝 Создан образец документа")
     
     def semantic_search(self, query, top_k=3):
-        """Семантический поиск с использованием FAISS"""
-        if not self.loaded or not self.chunks or self.index is None:
+        """Семантический поиск с использованием косинусного сходства"""
+        if not self.loaded or not self.chunks or self.embeddings is None:
             return []
         
         try:
             # Создаем эмбеддинг для запроса
             query_embedding = self.model.encode([query])
-            faiss.normalize_L2(query_embedding)
             
-            # Ищем в индексе
-            distances, indices = self.index.search(query_embedding, top_k)
+            # Вычисляем косинусное сходство
+            similarities = cosine_similarity(query_embedding, self.embeddings)[0]
+            
+            # Получаем топ-K наиболее релевантных фрагментов
+            top_indices = np.argsort(similarities)[::-1][:top_k]
             
             results = []
-            for i, idx in enumerate(indices[0]):
-                if idx < len(self.chunks) and distances[0][i] > 0.3:  # Порог релевантности
+            for idx in top_indices:
+                if similarities[idx] > 0.3:  # Порог релевантности
                     chunk = self.chunks[idx]
                     results.append({
                         'file': chunk['file'],
                         'text': chunk['text'],
-                        'score': float(distances[0][i]),
+                        'score': float(similarities[idx]),
                         'file_path': chunk['file_path']
                     })
             
@@ -336,13 +327,13 @@ def send_welcome(message):
 def send_status(message):
     doc_count = len(doc_search.documents)
     chunk_count = len(doc_search.chunks) if doc_search.chunks else 0
-    has_index = doc_search.index is not None
+    has_embeddings = doc_search.embeddings is not None
     
     status_info = f"""📊 **Статус системы:**
 
 • Документов загружено: {doc_count}
 • Фрагментов проиндексировано: {chunk_count}
-• Векторный поиск: {'✅ Активен' if has_index else '❌ Не готов'}
+• Семантический поиск: {'✅ Активен' if has_embeddings else '❌ Не готов'}
 • DeepSeek API: {'✅ Настроен' if DEEPSEEK_API_KEY else '❌ Не настроен'}
 
 💡 Система готова к работе!"""
@@ -378,7 +369,7 @@ def handle_message(message):
 
 def main():
     """Основная функция запуска"""
-    logger.info("🚀 Запуск профессионального бота с FAISS...")
+    logger.info("🚀 Запуск профессионального бота...")
     
     # Запускаем бота в отдельном потоке
     bot_thread = threading.Thread(target=bot.infinity_polling, daemon=True)
