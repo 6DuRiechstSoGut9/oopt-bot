@@ -9,8 +9,9 @@ import requests
 import PyPDF2
 import docx
 import numpy as np
-from sentence_transformers import SentenceTransformer
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+import re
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -35,20 +36,13 @@ if not DEEPSEEK_API_KEY:
 
 bot = telebot.TeleBot(TOKEN)
 
-class ImprovedDocumentSearch:
+class LightweightDocumentSearch:
     def __init__(self):
         self.documents = []
         self.chunks = []
-        self.embeddings = None
+        self.vectorizer = None
+        self.tfidf_matrix = None
         self.loaded = False
-        self.model = None
-        
-        try:
-            logger.info("🔄 Загрузка модели для семантического поиска...")
-            self.model = SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
-            logger.info("✅ Модель для эмбеддингов загружена")
-        except Exception as e:
-            logger.error(f"❌ Ошибка загрузки модели: {e}")
     
     def extract_text_from_file(self, file_path):
         """Извлечение текста из разных форматов файлов"""
@@ -73,27 +67,29 @@ class ImprovedDocumentSearch:
             logger.error(f"Ошибка чтения файла {file_path}: {e}")
         return text
     
-    def split_text_into_chunks(self, text, chunk_size=800, overlap=100):
-        """Увеличиваем размер фрагментов для лучшего контекста"""
-        sentences = text.split('. ')
+    def preprocess_text(self, text):
+        """Очистка текста для лучшего поиска"""
+        # Удаляем лишние пробелы и переносы
+        text = re.sub(r'\s+', ' ', text)
+        # Приводим к нижнему регистру
+        text = text.lower()
+        return text.strip()
+    
+    def split_text_into_chunks(self, text, chunk_size=1000, overlap=100):
+        """Разбиваем текст на фрагменты"""
+        words = text.split()
         chunks = []
-        current_chunk = ""
         
-        for sentence in sentences:
-            if len(current_chunk + sentence) < chunk_size:
-                current_chunk += sentence + ". "
-            else:
-                if current_chunk:
-                    chunks.append(current_chunk.strip())
-                current_chunk = sentence + ". "
-        
-        if current_chunk:
-            chunks.append(current_chunk.strip())
-            
+        for i in range(0, len(words), chunk_size - overlap):
+            chunk = ' '.join(words[i:i + chunk_size])
+            chunks.append(chunk)
+            if i + chunk_size >= len(words):
+                break
+                
         return chunks
     
     def load_documents(self):
-        """Загружаем все документы и создаем эмбеддинги"""
+        """Загружаем все документы и создаем поисковый индекс"""
         documents_dir = 'documents'
         if not os.path.exists(documents_dir):
             logger.warning(f"❌ Папка {documents_dir} не найдена")
@@ -115,39 +111,49 @@ class ImprovedDocumentSearch:
                     
                     text = self.extract_text_from_file(file_path)
                     if text and len(text.strip()) > 10:
+                        # Очищаем текст
+                        cleaned_text = self.preprocess_text(text)
+                        
                         # Разбиваем текст на фрагменты
-                        text_chunks = self.split_text_into_chunks(text)
+                        text_chunks = self.split_text_into_chunks(cleaned_text)
                         
                         for i, chunk in enumerate(text_chunks):
                             self.chunks.append({
                                 'file': file,
                                 'chunk_id': i,
                                 'text': chunk,
-                                'file_path': file_path
+                                'original_text': text[i*1000:(i+1)*1000] if i == 0 else ""  # Сохраняем оригинал для ответа
                             })
                             chunk_count += 1
                         
                         self.documents.append({
                             'file': file,
-                            'text': text,
+                            'text': cleaned_text,
                             'size': len(text),
                             'chunks': len(text_chunks)
                         })
                         file_count += 1
         
-        # Создаем эмбеддинги для всех фрагментов
-        if self.chunks and self.model:
-            logger.info(f"🔄 Создаем эмбеддинги для {chunk_count} фрагментов...")
+        # Создаем TF-IDF матрицу для поиска
+        if self.chunks:
+            logger.info(f"🔄 Создаем поисковый индекс для {chunk_count} фрагментов...")
             chunk_texts = [chunk['text'] for chunk in self.chunks]
-            self.embeddings = self.model.encode(chunk_texts, show_progress_bar=False)
-            logger.info("✅ Эмбеддинги созданы")
+            
+            self.vectorizer = TfidfVectorizer(
+                max_features=10000,
+                min_df=1,
+                max_df=0.8,
+                stop_words='english'
+            )
+            self.tfidf_matrix = self.vectorizer.fit_transform(chunk_texts)
+            logger.info("✅ Поисковый индекс создан")
         
         self.loaded = True
         logger.info(f"✅ Загружено документов: {file_count}, фрагментов: {chunk_count}")
     
     def create_sample_document(self):
         """Создаем тестовый документ если нет документов"""
-        sample_text = """Верховинский лес - особо охраняемая природная территория. 
+        sample_text = """Верховинский лес - особо охраняемая природная территория в Вологодской области.
         
 Орнитофауна Верховинского леса включает следующие виды птиц:
 - Певчие птицы: зяблик, пеночка-теньковка, зарянка, певчий дрозд
@@ -156,13 +162,10 @@ class ImprovedDocumentSearch:
 - Дятлы: большой пестрый дятел, белоспинный дятел
 - Совы: серая неясыть, ушастая сова
 
-В период миграции в лесу останавливаются стаи дроздов, зябликов и других перелетных птиц."""
+В период миграции в лесу останавливаются стаи дроздов, зябликов и других перелетных птиц. Лес характеризуется богатым видовым разнообразием птиц благодаря разнообразным биотопам."""
         
-        sample_path = 'documents/Верховинский лес.docx'
-        os.makedirs('documents', exist_ok=True)
-        
-        # Создаем простой txt файл вместо docx для простоты
         sample_path = 'documents/Верховинский лес.txt'
+        os.makedirs('documents', exist_ok=True)
         with open(sample_path, 'w', encoding='utf-8') as f:
             f.write(sample_text)
         
@@ -171,32 +174,32 @@ class ImprovedDocumentSearch:
         logger.info("📝 Создан образец документа")
     
     def semantic_search(self, query, top_k=5):
-        """Улучшенный семантический поиск"""
-        if not self.loaded or not self.chunks or self.embeddings is None:
+        """Поиск по смыслу с использованием TF-IDF"""
+        if not self.loaded or not self.chunks or self.tfidf_matrix is None:
             return []
         
         try:
-            # Создаем эмбеддинг для запроса
-            query_embedding = self.model.encode([query])
+            # Преобразуем запрос в TF-IDF вектор
+            query_vec = self.vectorizer.transform([self.preprocess_text(query)])
             
             # Вычисляем косинусное сходство
-            similarities = cosine_similarity(query_embedding, self.embeddings)[0]
+            similarities = cosine_similarity(query_vec, self.tfidf_matrix).flatten()
             
             # Получаем топ-K наиболее релевантных фрагментов
             top_indices = np.argsort(similarities)[::-1][:top_k]
             
             results = []
             for idx in top_indices:
-                if similarities[idx] > 0.2:  # Понижаем порог для большего охвата
+                if similarities[idx] > 0.1:  # Порог релевантности
                     chunk = self.chunks[idx]
                     results.append({
                         'file': chunk['file'],
                         'text': chunk['text'],
                         'score': float(similarities[idx]),
-                        'file_path': chunk['file_path']
+                        'original_text': chunk.get('original_text', chunk['text'])
                     })
             
-            # Группируем по файлам и выбираем лучшие фрагменты из каждого
+            # Группируем по файлам и выбираем лучшие фрагменты
             file_results = {}
             for result in results:
                 filename = result['file']
@@ -206,7 +209,7 @@ class ImprovedDocumentSearch:
             return list(file_results.values())[:3]  # Возвращаем топ-3 из разных файлов
             
         except Exception as e:
-            logger.error(f"Ошибка семантического поиска: {e}")
+            logger.error(f"Ошибка поиска: {e}")
             return []
     
     def search_documents(self, query):
@@ -216,35 +219,37 @@ class ImprovedDocumentSearch:
     def generate_intelligent_answer(self, query, search_results):
         """Генерирует интеллектуальный ответ на основе найденной информации"""
         if not search_results:
-            return "К сожалению, в документах не найдено конкретной информации по вашему запросу."
+            return "❌ В документах не найдено информации по вашему запросу.\n\n💡 Попробуйте переформулировать вопрос или уточнить название ООПТ."
         
         # Собираем всю релевантную информацию
         context_parts = []
         for result in search_results:
-            context_parts.append(f"Из документа '{result['file']}': {result['text']}")
+            context_parts.append(f"Документ: {result['file']}\nИнформация: {result['text']}")
         
         context = "\n\n".join(context_parts)
         
         prompt = f"""Пользователь спрашивает: "{query}"
 
-На основе следующей информации из документов составь КРАТКИЙ и ИНФОРМАТИВНЫЙ ответ. Если информации недостаточно, так и скажи.
+На основе СЛЕДУЮЩЕЙ информации из документов составь КРАТКИЙ и ИНФОРМАТИВНЫЙ ответ. 
+Отвечай ТОЛЬКО на основе предоставленных данных. Не придумывай ничего!
 
 ИНФОРМАЦИЯ ИЗ ДОКУМЕНТОВ:
 {context}
 
 Требования к ответу:
-- Будь краток и точен
-- Перечисли конкретные факты из документов
+- Будь конкретен и точен
+- Перечисли только факты из документов
+- Если информации мало, так и скажи
 - Не добавляй информацию, которой нет в документах
-- Если в документах мало информации, так и скажи
+- Ответ должен быть кратким (3-5 предложений)
 
 ОТВЕТ:"""
         
         if not DEEPSEEK_API_KEY:
-            # Если API нет, формируем простой ответ самостоятельно
+            # Если API нет, формируем простой ответ
             files = ", ".join(set(r['file'] for r in search_results))
-            best_text = search_results[0]['text'][:300] + "..." if len(search_results[0]['text']) > 300 else search_results[0]['text']
-            return f"Найдена информация в документах: {files}\n\nОсновные сведения: {best_text}"
+            best_match = search_results[0]['text']
+            return f"📄 Найдено в документасх: {files}\n\n📝 Информация: {best_match[:400]}..."
         
         try:
             headers = {
@@ -257,7 +262,7 @@ class ImprovedDocumentSearch:
                 "messages": [
                     {
                         "role": "system", 
-                        "content": "Ты помощник, который точно отвечает на основе предоставленных документов. Не придумывай информацию."
+                        "content": "Ты - точный помощник. Отвечай ТОЛЬКО на основе предоставленных документов. Не добавляй информацию."
                     },
                     {
                         "role": "user", 
@@ -265,7 +270,7 @@ class ImprovedDocumentSearch:
                     }
                 ],
                 "max_tokens": 500,
-                "temperature": 0.3
+                "temperature": 0.1  # Низкая температура для точности
             }
             
             response = requests.post(
@@ -283,20 +288,25 @@ class ImprovedDocumentSearch:
                 sources = ", ".join(set(result['file'] for result in search_results))
                 return f"{answer}\n\n📚 Источники: {sources}"
             else:
-                return f"❌ Ошибка при обработке запроса. Статус: {response.status_code}"
+                logger.error(f"DeepSeek API error: {response.text}")
+                # Возвращаем ответ без нейросети
+                files = ", ".join(set(r['file'] for r in search_results))
+                best_info = "\n".join([f"• {r['file']}: {r['text'][:200]}..." for r in search_results[:2]])
+                return f"📄 По вашему запросу найдено:\n\n{best_info}\n\n📚 Файлы: {files}"
                 
         except Exception as e:
             logger.error(f"DeepSeek request exception: {e}")
             # Возвращаем ответ без нейросети
             files = ", ".join(set(r['file'] for r in search_results))
-            return f"По вашему запросу найдена информация в документах: {files}\n\nДля получения точного ответа проверьте указанные документы."
+            best_info = search_results[0]['text'][:300] + "..." if len(search_results[0]['text']) > 300 else search_results[0]['text']
+            return f"📄 Найдено в документах: {files}\n\n📝 Информация: {best_info}"
 
 # Инициализация системы поиска
-doc_search = ImprovedDocumentSearch()
+doc_search = LightweightDocumentSearch()
 
 def initialize_documents():
     """Инициализация документов в отдельном потоке"""
-    logger.info("🔄 Загрузка документов и создание эмбеддингов...")
+    logger.info("🔄 Загрузка документов...")
     doc_search.load_documents()
     logger.info(f"✅ Загружено документов: {len(doc_search.documents)}")
 
@@ -305,16 +315,20 @@ threading.Thread(target=initialize_documents, daemon=True).start()
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    welcome_text = """🤖 Бот ООПТ Вологодской области
+    status = "✅ Загружено" if doc_search.loaded else "🔄 Загрузка..."
+    doc_count = len(doc_search.documents)
+    
+    welcome_text = f"""🤖 Бот ООПТ Вологодской области
 
 📚 **Умный поиск** по документам об ООПТ
+{status} документов: {doc_count}
 
 💡 **Просто задайте вопрос**, например:
 • "Какие птицы живут в Верховинском лесу?"
 • "ООПТ Вытегорского района"  
 • "Площадь Шимозерского заказника"
 
-🎯 Бот понимает смысл вопросов и ищет по всем документам!
+🎯 Бот понимает смысл вопросов!
 
 📊 Статус: /status"""
     
@@ -323,13 +337,16 @@ def send_welcome(message):
 @bot.message_handler(commands=['status'])
 def send_status(message):
     doc_count = len(doc_search.documents)
+    chunk_count = len(doc_search.chunks) if doc_search.chunks else 0
+    
     status_info = f"""📊 **Статус системы:**
 
 • Документов загружено: {doc_count}
-• Семантический поиск: {'✅ Активен' if doc_search.loaded else '🔄 Загрузка'}
-• Система готова к работе!
+• Фрагментов проиндексировано: {chunk_count}
+• Поисковый индекс: {'✅ Активен' if doc_search.loaded else '🔄 Загрузка'}
+• DeepSeek API: {'✅ Настроен' if DEEPSEEK_API_KEY else '❌ Не настроен'}
 
-💡 Задавайте вопросы об ООПТ Вологодской области"""
+💡 Система готова к работе!"""
     
     bot.reply_to(message, status_info)
 
@@ -338,7 +355,7 @@ def handle_message(message):
     bot.send_chat_action(message.chat.id, 'typing')
     
     if not doc_search.loaded:
-        bot.reply_to(message, "🔄 Документы еще загружаются... Попробуйте через минуту.")
+        bot.reply_to(message, "🔄 Документы загружаются... Попробуйте через 10 секунд.")
         return
     
     user_query = message.text.strip()
@@ -362,7 +379,7 @@ def handle_message(message):
 
 def main():
     """Основная функция запуска"""
-    logger.info("🚀 Запуск улучшенного бота...")
+    logger.info("🚀 Запуск облегченного бота...")
     
     # Запускаем бота в отдельном потоке
     bot_thread = threading.Thread(target=bot.infinity_polling, daemon=True)
