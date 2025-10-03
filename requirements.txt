@@ -1,10 +1,10 @@
 pytelegrambotapi==4.19.2
 flask==2.3.3
-waitress==3.0.0
+waitress==2.1.2
 python-dotenv==1.0.0
 requests==2.31.0
-openai==1.30.5
 pypdf2==3.0.1
 python-docx==1.1.0
+faiss-cpu==1.7.4
+sentence-transformers==2.2.2
 numpy==1.24.3
-scikit-learn==1.3.2
