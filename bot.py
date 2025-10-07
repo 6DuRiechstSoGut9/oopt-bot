@@ -11,7 +11,6 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 import re
 import faiss
-import json
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -36,8 +35,8 @@ def home():
 def health_check():
     return jsonify({
         "status": "healthy", 
-        "documents_loaded": len(doc_search.documents),
-        "bot_ready": doc_search.loaded
+        "documents_loaded": len(doc_search.documents) if hasattr(doc_search, 'documents') else 0,
+        "bot_ready": doc_search.loaded if hasattr(doc_search, 'loaded') else False
     })
 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
@@ -60,7 +59,8 @@ class GigaChatAPI:
         try:
             headers = {
                 'Authorization': f'Bearer {self.credentials}',
-                'Content-Type': 'application/x-www-form-urlencoded'
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Accept': 'application/json'
             }
             data = {'scope': 'GIGACHAT_API_PERS'}
             
@@ -69,7 +69,7 @@ class GigaChatAPI:
                 headers=headers,
                 data=data,
                 verify=False,
-                timeout=10
+                timeout=30
             )
             
             if response.status_code == 200:
@@ -78,7 +78,7 @@ class GigaChatAPI:
                 logger.info("✅ GigaChat токен получен")
                 return self.access_token
             else:
-                logger.error(f"❌ Ошибка получения токена: {response.status_code}")
+                logger.error(f"❌ Ошибка получения токена: {response.status_code} - {response.text}")
                 return None
                 
         except Exception as e:
@@ -94,7 +94,8 @@ class GigaChatAPI:
         try:
             headers = {
                 'Authorization': f'Bearer {self.access_token}',
-                'Content-Type': 'application/json'
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
             }
             
             data = {
@@ -116,7 +117,7 @@ class GigaChatAPI:
                 result = response.json()
                 return result['choices'][0]['message']['content']
             else:
-                logger.error(f"❌ GigaChat API error: {response.status_code}")
+                logger.error(f"❌ GigaChat API error: {response.status_code} - {response.text}")
                 return None
                 
         except Exception as e:
@@ -162,17 +163,18 @@ class ProfessionalDocumentSearch:
     
     def split_text_into_chunks(self, text, chunk_size=500, overlap=50):
         """Разбиваем текст на перекрывающиеся фрагменты"""
-        sentences = re.split(r'[.!?]+', text)
+        # Простое разбиение по предложениям
+        sentences = re.split(r'(?<=[.!?])\s+', text)
         chunks = []
         current_chunk = ""
         
         for sentence in sentences:
-            if len(current_chunk) + len(sentence) < chunk_size:
-                current_chunk += sentence + ". "
+            if len(current_chunk) + len(sentence) <= chunk_size:
+                current_chunk += sentence + " "
             else:
                 if current_chunk:
                     chunks.append(current_chunk.strip())
-                current_chunk = sentence + ". "
+                current_chunk = sentence + " "
         
         if current_chunk:
             chunks.append(current_chunk.strip())
@@ -473,7 +475,8 @@ def main():
     bot_thread.start()
     
     # Запускаем Flask приложение
-    app.run(host='0.0.0.0', port=PORT, debug=False)
+    from waitress import serve
+    serve(app, host='0.0.0.0', port=PORT)
 
 if __name__ == '__main__':
     main()
