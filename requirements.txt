@@ -5,7 +5,7 @@ huggingface_hub==0.16.4
 tokenizers==0.12.1
 
 # PyTorch CPU (совместимо с Python 3.11–3.13)
-torch==2.7.1
+torch==2.7.0
 torchvision==0.22.0
 -f https://download.pytorch.org/whl/cpu/torch_stable.html
 
@@ -19,3 +19,4 @@ sentencepiece==0.2.1
 tqdm==4.65.0
 python-dotenv==1.0.0
 requests==2.31.0
+
