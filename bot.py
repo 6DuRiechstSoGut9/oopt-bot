@@ -3,16 +3,15 @@ import logging
 import threading
 import telebot
 from flask import Flask, jsonify
-from waitress import serve
 from dotenv import load_dotenv
 import requests
 import PyPDF2
 import docx
 import numpy as np
 from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
 import re
-import uuid
+import faiss
+import json
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -31,7 +30,7 @@ PORT = int(os.environ.get('PORT', 8000))
 
 @app.route('/')
 def home():
-    return "🤖 Бот ООПТ работает!"
+    return "🤖 Бот ООПТ Вологодской области работает!"
 
 @app.route('/health')
 def health_check():
@@ -55,7 +54,6 @@ class GigaChatAPI:
         self.credentials = credentials
         self.base_url = "https://gigachat.devices.sberbank.ru/api/v1"
         self.access_token = None
-        self.token_expires = 0
         
     def get_access_token(self):
         """Получаем access token для GigaChat API"""
@@ -64,11 +62,8 @@ class GigaChatAPI:
                 'Authorization': f'Bearer {self.credentials}',
                 'Content-Type': 'application/x-www-form-urlencoded'
             }
-            data = {
-                'scope': 'GIGACHAT_API_PERS'
-            }
+            data = {'scope': 'GIGACHAT_API_PERS'}
             
-            # Отключаем проверку SSL для совместимости
             response = requests.post(
                 'https://ngw.devices.sberbank.ru:9443/api/v2/oauth',
                 headers=headers,
@@ -80,7 +75,6 @@ class GigaChatAPI:
             if response.status_code == 200:
                 token_data = response.json()
                 self.access_token = token_data['access_token']
-                self.token_expires = threading.get_ident() + 1800
                 logger.info("✅ GigaChat токен получен")
                 return self.access_token
             else:
@@ -91,21 +85,15 @@ class GigaChatAPI:
             logger.error(f"❌ Исключение при получении токена: {e}")
             return None
     
-    def get_valid_token(self):
-        """Получаем валидный токен (обновляем если истек)"""
-        if not self.access_token or threading.get_ident() > self.token_expires:
-            return self.get_access_token()
-        return self.access_token
-    
     def chat_completion(self, messages, temperature=0.1, max_tokens=500):
         """Отправляем запрос к GigaChat API"""
-        token = self.get_valid_token()
-        if not token:
-            return None
-            
+        if not self.access_token:
+            if not self.get_access_token():
+                return None
+        
         try:
             headers = {
-                'Authorization': f'Bearer {token}',
+                'Authorization': f'Bearer {self.access_token}',
                 'Content-Type': 'application/json'
             }
             
@@ -143,6 +131,7 @@ class ProfessionalDocumentSearch:
         self.model = None
         self.loaded = False
         self.gigachat = None
+        self.faiss_index = None
         
         # Инициализируем GigaChat если есть credentials
         if GIGACHAT_CREDENTIALS:
@@ -242,12 +231,21 @@ class ProfessionalDocumentSearch:
                         })
                         file_count += 1
         
-        # Создаем эмбеддинги для всех фрагментов
+        # Создаем эмбеддинги и FAISS индекс
         if self.chunks and self.model:
             logger.info(f"🔄 Создаем эмбеддинги для {chunk_count} фрагментов...")
             chunk_texts = [chunk['text'] for chunk in self.chunks]
             self.embeddings = self.model.encode(chunk_texts)
-            logger.info(f"✅ Эмбеддинги созданы. Размерность: {self.embeddings.shape[1]}")
+            
+            # Создаем FAISS индекс для косинусного сходства
+            dimension = self.embeddings.shape[1]
+            self.faiss_index = faiss.IndexFlatIP(dimension)  # Inner Product для косинусного сходства
+            
+            # Нормализуем векторы для косинусного сходства
+            faiss.normalize_L2(self.embeddings)
+            self.faiss_index.add(self.embeddings.astype(np.float32))
+            
+            logger.info(f"✅ FAISS индекс создан. Размерность: {dimension}")
         
         self.loaded = True
         logger.info(f"✅ Загружено документов: {file_count}, фрагментов: {chunk_count}")
@@ -275,28 +273,28 @@ class ProfessionalDocumentSearch:
         logger.info("📝 Создан образец документа")
     
     def semantic_search(self, query, top_k=3):
-        """Семантический поиск с использованием косинусного сходства"""
-        if not self.loaded or not self.chunks or self.embeddings is None:
+        """Семантический поиск с использованием FAISS"""
+        if not self.loaded or not self.chunks or self.faiss_index is None:
             return []
         
         try:
             # Создаем эмбеддинг для запроса
             query_embedding = self.model.encode([query])
             
-            # Вычисляем косинусное сходство
-            similarities = cosine_similarity(query_embedding, self.embeddings)[0]
+            # Нормализуем query embedding
+            faiss.normalize_L2(query_embedding)
             
-            # Получаем топ-K наиболее релевантных фрагментов
-            top_indices = np.argsort(similarities)[::-1][:top_k]
+            # Ищем в FAISS индексе
+            distances, indices = self.faiss_index.search(query_embedding.astype(np.float32), top_k)
             
             results = []
-            for idx in top_indices:
-                if similarities[idx] > 0.3:  # Порог релевантности
+            for i, idx in enumerate(indices[0]):
+                if idx < len(self.chunks) and distances[0][i] > 0.3:  # Порог релевантности
                     chunk = self.chunks[idx]
                     results.append({
                         'file': chunk['file'],
                         'text': chunk['text'],
-                        'score': float(similarities[idx]),
+                        'score': float(distances[0][i]),
                         'file_path': chunk['file_path']
                     })
             
