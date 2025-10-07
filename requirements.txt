@@ -1,4 +1,4 @@
-telebot==0.0.5
+pytelegrambotapi==4.14.0
 flask==2.3.3
 waitress==2.1.2
 python-dotenv==1.0.0
