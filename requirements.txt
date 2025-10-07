@@ -1,14 +1,16 @@
 python-telegram-bot==20.6
+
+# Используем более старые версии без Rust-сборки
 sentence-transformers==2.1.0
 transformers==4.30.2
-huggingface_hub==0.16.4
-tokenizers==0.12.1
+tokenizers==0.13.3
 
-# PyTorch CPU (совместимо с Python 3.11–3.13)
+# PyTorch CPU версия (совместимая и лёгкая)
 torch==2.7.0
 torchvision==0.22.0
 -f https://download.pytorch.org/whl/cpu/torch_stable.html
 
+# Остальные зависимости
 pypdf==3.9.0
 faiss-cpu==1.12.0
 nltk==3.9.2
@@ -19,4 +21,4 @@ sentencepiece==0.2.1
 tqdm==4.65.0
 python-dotenv==1.0.0
 requests==2.31.0
-
+huggingface_hub==0.16.4
