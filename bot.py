@@ -1,8 +1,6 @@
-# bot_webhook.py
-# Работает с python-telegram-bot v20 (async style)
-# Использует transformers AutoTokenizer (use_fast=False) и AutoModel для эмбеддингов
-# Simple mean pooling -> L2-normalize -> cosine similarity
-# Webhook для Render
+# bot.py
+# Работает с python-telegram-bot v20+ (async style)
+# Использует transformers AutoTokenizer и AutoModel для эмбеддингов
 
 import os
 import logging
@@ -18,20 +16,21 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 
 # ---------- CONFIG ----------
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # https://yourapp.onrender.com/
+PORT = int(os.environ.get("PORT", 8443))  # Render передает порт через переменную окружения
+
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 DOCS_DIR = Path("documents")
 CHUNK_SIZE = 400
-EMBED_DEVICE = "cpu"  # Render free — CPU
+EMBED_DEVICE = "cpu"
 TOP_K = 3
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # пример: https://your-service.onrender.com
-PORT = int(os.environ.get("PORT", 8443))
 # ----------------------------
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------- Loader / Index ----------
+# ---------- Embedding Index ----------
 class SimpleEmbeddingIndex:
     def __init__(self, model_name: str, device: str = "cpu"):
         logger.info("Loading tokenizer and model (use_fast=False)...")
@@ -56,8 +55,8 @@ class SimpleEmbeddingIndex:
         self.model.eval()
         with torch.no_grad():
             for i in range(0, len(texts), batch_size):
-                batch = texts[i:i+batch_size]
-                enc = self.tokenizer(batch, padding=True, truncation=True, max_length=512, return_tensors="pt", return_attention_mask=True)
+                batch = texts[i : i + batch_size]
+                enc = self.tokenizer(batch, padding=True, truncation=True, max_length=512, return_tensors="pt")
                 input_ids = enc["input_ids"].to(self.device)
                 attention_mask = enc["attention_mask"].to(self.device)
                 out = self.model(input_ids=input_ids, attention_mask=attention_mask)
@@ -69,13 +68,13 @@ class SimpleEmbeddingIndex:
     def build_from_texts(self, texts: List[str]):
         logger.info(f"Building index for {len(texts)} texts...")
         self.texts = texts
-        self.embs = self.encode(texts, batch_size=8)
+        self.embs = self.encode(texts)
 
     def search(self, query: str, top_k: int = 3):
         q_emb = self.encode([query])
         if q_emb.shape[0] == 0 or self.embs.shape[0] == 0:
             return []
-        sims = self.embs @ q_emb[0]
+        sims = (self.embs @ q_emb[0])
         topk_idx = np.argsort(-sims)[:top_k]
         results = [(int(idx), float(sims[idx])) for idx in topk_idx]
         return results
@@ -97,8 +96,7 @@ def load_documents_chunks(directory: Path, chunk_size: int = 400) -> List[str]:
         n = len(text)
         while start < n:
             end = min(n, start + chunk_size)
-            chunk = text[start:end].strip()
-            texts.append(chunk)
+            texts.append(text[start:end].strip())
             start = end
     if not texts:
         texts.append("Пример содержимого. Добавьте файлы .txt в папку documents для индексации.")
@@ -139,7 +137,7 @@ class BotApp:
 # ---------- Entrypoint ----------
 def main():
     if not TOKEN:
-        logger.error("TELEGRAM_BOT_TOKEN не установлен в environment. Выход.")
+        logger.error("TELEGRAM_BOT_TOKEN не установлен. Выход.")
         return
     if not WEBHOOK_URL:
         logger.error("WEBHOOK_URL не установлен. Выход.")
@@ -156,7 +154,8 @@ def main():
     application.run_webhook(
         listen="0.0.0.0",
         port=PORT,
-        webhook_url=WEBHOOK_URL
+        url_path=TOKEN,
+        webhook_url=f"{WEBHOOK_URL}{TOKEN}",
     )
 
 if __name__ == "__main__":
