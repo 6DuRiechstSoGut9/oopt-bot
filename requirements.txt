@@ -1,11 +1,26 @@
+# Telegram bot
 python-telegram-bot==20.6
+
+# Sentence Transformers & Transformers
+sentence-transformers==2.2.2
+transformers==4.30.2
+huggingface_hub==0.16.4
+tokenizers==0.13.3
+
+# PyTorch CPU version for Python 3.11
+torch==2.8.0+cpu
+torchvision==0.23.0+cpu
+-f https://download.pytorch.org/whl/cpu/torch_stable.html
+
+# PDF and NLP
+pypdf==3.9.0
 faiss-cpu==1.12.0
+nltk==3.9.2
+scikit-learn==1.7.2
+scipy==1.16.2
+sentencepiece==0.2.1
+
+# Utilities
 tqdm==4.65.0
 python-dotenv==1.0.0
 requests==2.31.0
-torch==2.8.0
-transformers==4.30.2
-sentence-transformers==2.2.2
-huggingface-hub==0.16.4
-pypdf==3.9.0
-
