@@ -2,7 +2,7 @@ import os
 import logging
 import threading
 import telebot
-from flask import Flask
+from flask import Flask, jsonify
 from waitress import serve
 from dotenv import load_dotenv
 import requests
@@ -12,6 +12,7 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 import re
+import uuid
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -24,17 +25,115 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-app.route('/')(lambda: "🤖 Бот ООПТ работает!")
+
+# Получаем порт из переменных окружения Render
+PORT = int(os.environ.get('PORT', 8000))
+
+@app.route('/')
+def home():
+    return "🤖 Бот ООПТ работает!"
+
+@app.route('/health')
+def health_check():
+    return jsonify({
+        "status": "healthy", 
+        "documents_loaded": len(doc_search.documents),
+        "bot_ready": doc_search.loaded
+    })
 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
-DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY')
+GIGACHAT_CREDENTIALS = os.getenv('GIGACHAT_CREDENTIALS')
 
 if not TOKEN:
     logger.error("❌ TELEGRAM_TOKEN не установлен!")
-if not DEEPSEEK_API_KEY:
-    logger.warning("⚠️ DEEPSEEK_API_KEY не установлен")
+    raise ValueError("TELEGRAM_TOKEN обязателен для работы бота")
 
 bot = telebot.TeleBot(TOKEN)
+
+class GigaChatAPI:
+    def __init__(self, credentials):
+        self.credentials = credentials
+        self.base_url = "https://gigachat.devices.sberbank.ru/api/v1"
+        self.access_token = None
+        self.token_expires = 0
+        
+    def get_access_token(self):
+        """Получаем access token для GigaChat API"""
+        try:
+            headers = {
+                'Authorization': f'Bearer {self.credentials}',
+                'Content-Type': 'application/x-www-form-urlencoded'
+            }
+            data = {
+                'scope': 'GIGACHAT_API_PERS'
+            }
+            
+            # Отключаем проверку SSL для совместимости
+            response = requests.post(
+                'https://ngw.devices.sberbank.ru:9443/api/v2/oauth',
+                headers=headers,
+                data=data,
+                verify=False,
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                token_data = response.json()
+                self.access_token = token_data['access_token']
+                self.token_expires = threading.get_ident() + 1800
+                logger.info("✅ GigaChat токен получен")
+                return self.access_token
+            else:
+                logger.error(f"❌ Ошибка получения токена: {response.status_code}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"❌ Исключение при получении токена: {e}")
+            return None
+    
+    def get_valid_token(self):
+        """Получаем валидный токен (обновляем если истек)"""
+        if not self.access_token or threading.get_ident() > self.token_expires:
+            return self.get_access_token()
+        return self.access_token
+    
+    def chat_completion(self, messages, temperature=0.1, max_tokens=500):
+        """Отправляем запрос к GigaChat API"""
+        token = self.get_valid_token()
+        if not token:
+            return None
+            
+        try:
+            headers = {
+                'Authorization': f'Bearer {token}',
+                'Content-Type': 'application/json'
+            }
+            
+            data = {
+                "model": "GigaChat",
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens
+            }
+            
+            response = requests.post(
+                f'{self.base_url}/chat/completions',
+                headers=headers,
+                json=data,
+                verify=False,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                return result['choices'][0]['message']['content']
+            else:
+                logger.error(f"❌ GigaChat API error: {response.status_code}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"❌ GigaChat request exception: {e}")
+            return None
 
 class ProfessionalDocumentSearch:
     def __init__(self):
@@ -43,6 +142,11 @@ class ProfessionalDocumentSearch:
         self.embeddings = None
         self.model = None
         self.loaded = False
+        self.gigachat = None
+        
+        # Инициализируем GigaChat если есть credentials
+        if GIGACHAT_CREDENTIALS:
+            self.gigachat = GigaChatAPI(GIGACHAT_CREDENTIALS)
     
     def extract_text_from_file(self, file_path):
         """Извлечение текста из разных форматов файлов"""
@@ -234,57 +338,39 @@ class ProfessionalDocumentSearch:
 
 ОТВЕТ:"""
         
-        if not DEEPSEEK_API_KEY:
-            # Если API нет, формируем простой ответ
+        if not self.gigachat:
+            # Если GigaChat не настроен, формируем простой ответ
             files = ", ".join(set(r['file'] for r in search_results))
             best_match = search_results[0]['text']
             return f"📄 Найдено в документах: {files}\n\n📝 Релевантная информация: {best_match}"
         
         try:
-            headers = {
-                "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-                "Content-Type": "application/json"
-            }
+            messages = [
+                {
+                    "role": "system", 
+                    "content": "Ты - помощник по ООПТ Вологодской области. Отвечай точно на основе предоставленных документов. Не придумывай информацию."
+                },
+                {
+                    "role": "user", 
+                    "content": prompt
+                }
+            ]
             
-            data = {
-                "model": "deepseek-chat",
-                "messages": [
-                    {
-                        "role": "system", 
-                        "content": "Ты - помощник по ООПТ Вологодской области. Отвечай точно на основе предоставленных документов. Не придумывай информацию."
-                    },
-                    {
-                        "role": "user", 
-                        "content": prompt
-                    }
-                ],
-                "max_tokens": 500,
-                "temperature": 0.1
-            }
+            answer = self.gigachat.chat_completion(messages)
             
-            response = requests.post(
-                "https://api.deepseek.com/chat/completions",
-                headers=headers,
-                json=data,
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                result = response.json()
-                answer = result['choices'][0]['message']['content']
-                
+            if answer:
                 # Добавляем источники
                 sources = ", ".join(set(result['file'] for result in search_results))
                 return f"{answer}\n\n📚 Источники: {sources}"
             else:
-                logger.error(f"DeepSeek API error: {response.text}")
+                logger.error("GigaChat вернул пустой ответ")
                 # Возвращаем ответ без нейросети
                 files = ", ".join(set(r['file'] for r in search_results))
-                best_info = "\n".join([f"• {r['file']}: {r['text']}" for r in search_results])
+                best_info = "\n".join([f"• {r['file']}: {r['text'][:200]}..." for r in search_results])
                 return f"📄 По вашему запросу найдена информация:\n\n{best_info}\n\n📚 Файлы: {files}"
                 
         except Exception as e:
-            logger.error(f"DeepSeek request exception: {e}")
+            logger.error(f"GigaChat request exception: {e}")
             # Возвращаем ответ без нейросети
             files = ", ".join(set(r['file'] for r in search_results))
             best_info = search_results[0]['text']
@@ -299,18 +385,20 @@ def initialize_documents():
     doc_search.load_documents()
     logger.info(f"✅ Загружено документов: {len(doc_search.documents)}")
 
-# Запускаем инициализацию
+# Запускаем инициализацию в фоне
 threading.Thread(target=initialize_documents, daemon=True).start()
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     status = "✅ Загружено" if doc_search.loaded else "🔄 Загрузка..."
     doc_count = len(doc_search.documents)
+    has_gigachat = doc_search.gigachat is not None
     
     welcome_text = f"""🤖 Бот ООПТ Вологодской области
 
 📚 **Профессиональный семантический поиск** по документам
 {status} документов: {doc_count}
+🤖 GigaChat: {'✅ Подключен' if has_gigachat else '❌ Не настроен'}
 
 💡 **Задавайте вопросы естественным языком:**
 • "Какие птицы живут в Верховинском лесу?"
@@ -328,13 +416,14 @@ def send_status(message):
     doc_count = len(doc_search.documents)
     chunk_count = len(doc_search.chunks) if doc_search.chunks else 0
     has_embeddings = doc_search.embeddings is not None
+    has_gigachat = doc_search.gigachat is not None
     
     status_info = f"""📊 **Статус системы:**
 
 • Документов загружено: {doc_count}
 • Фрагментов проиндексировано: {chunk_count}
 • Семантический поиск: {'✅ Активен' if has_embeddings else '❌ Не готов'}
-• DeepSeek API: {'✅ Настроен' if DEEPSEEK_API_KEY else '❌ Не настроен'}
+• GigaChat API: {'✅ Настроен' if has_gigachat else '❌ Не настроен'}
 
 💡 Система готова к работе!"""
     
@@ -367,16 +456,26 @@ def handle_message(message):
         logger.error(f"Error sending message: {e}")
         bot.reply_to(message, "❌ Ошибка при отправке ответа.")
 
+def run_bot():
+    """Запуск бота в отдельном потоке"""
+    logger.info("🤖 Запуск Telegram бота...")
+    try:
+        bot.infinity_polling(timeout=60, long_polling_timeout=60)
+    except Exception as e:
+        logger.error(f"❌ Ошибка бота: {e}")
+        # Перезапуск через 10 секунд
+        threading.Timer(10.0, run_bot).start()
+
 def main():
     """Основная функция запуска"""
-    logger.info("🚀 Запуск профессионального бота...")
+    logger.info(f"🚀 Запуск приложения на порту {PORT}...")
     
     # Запускаем бота в отдельном потоке
-    bot_thread = threading.Thread(target=bot.infinity_polling, daemon=True)
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
     bot_thread.start()
     
-    logger.info("✅ Бот запущен. Запускаем веб-сервер...")
-    serve(app, host='0.0.0.0', port=8000)
+    # Запускаем Flask приложение
+    app.run(host='0.0.0.0', port=PORT, debug=False)
 
 if __name__ == '__main__':
     main()
