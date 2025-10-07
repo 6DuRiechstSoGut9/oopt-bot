@@ -1,7 +1,12 @@
 python-telegram-bot==20.6
-sentence-transformers==2.2.2
 faiss-cpu==1.12.0
 tqdm==4.65.0
 python-dotenv==1.0.0
 requests==2.31.0
+torch>=2.3.0
+transformers>=4.40.0
+sentence-transformers==2.2.2
+huggingface-hub==0.16.4
+pypdf>=3.9.0
+
 
