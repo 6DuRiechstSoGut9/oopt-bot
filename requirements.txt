@@ -1,6 +1,8 @@
-python-telegram-bot==20.6
+python-telegram-bot==22.3
 transformers==4.30.2
 torch==2.7.0
 numpy==1.26.4
 requests==2.31.0
 python-docx==0.8.11
+httpx==0.28.1
+gigachat==0.1.42.post2
