@@ -1,21 +1,13 @@
 # bot.py
-# Telegram-бот (python-telegram-bot v20+) для поиска по документам через эмбеддинги
-# Под Hugging Face Spaces: использует polling (application.run_polling())
-# Поддерживает .txt и .docx, экономит память через numpy.memmap (embeddings.dat)
-
 import os
 import logging
-import glob
 import json
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 
 import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModel
-
-# docx reader
-from docx import Document
 
 from telegram import Update
 from telegram.ext import (
@@ -29,105 +21,85 @@ from telegram.ext import (
 # ---------- CONFIG ----------
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
-    # лучше коротко логировать — при запуске в Spaces переменную задай в UI
     raise RuntimeError("TELEGRAM_BOT_TOKEN не установлен в окружении")
 
-MODEL_NAME = os.environ.get("MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
-DOCS_DIR = Path(os.environ.get("DOCS_DIR", "documents"))
-CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", 200))  # символов на кусок (меньше -> больше чанков)
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", 8))    # батч для encode
-EMBED_DEVICE = os.environ.get("EMBED_DEVICE", "cpu")  # "cpu" (Spaces free обычно CPU)
-TOP_K = int(os.environ.get("TOP_K", 3))
+MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+DOCS_DIR = Path("documents")
+BATCH_SIZE = 8
+TOP_K = 5
 
-# Файлы индекса на диске
+# Файлы индекса
 EMB_PATH = Path("embeddings.dat")
 TEXTS_PATH = Path("texts.json")
-META_PATH = Path("index_meta.json")
+META_PATH = Path("meta.json")
 
 # ----------------------------
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 
-# ---------- Utils for reading files ----------
-def read_txt(path: Path) -> str:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read()
-    except Exception:
-        with open(path, "r", encoding="latin-1") as f:
-            return f.read()
+def read_txt_file(path: Path) -> str:
+    """Чтение txt файлов с разными кодировками"""
+    for encoding in ['utf-8', 'cp1251', 'windows-1251', 'latin-1']:
+        try:
+            with open(path, "r", encoding=encoding) as f:
+                content = f.read().strip()
+                if content and len(content) > 10:
+                    logger.info(f"✅ Успешно прочитан {path.name} в кодировке {encoding}")
+                    return content
+        except Exception as e:
+            continue
+    
+    logger.error(f"❌ Не удалось прочитать {path.name} ни в одной кодировке")
+    return ""
 
 
-def read_docx(path: Path) -> str:
-    doc = Document(path)
-    paragraphs = [p.text for p in doc.paragraphs if p.text and p.text.strip()]
-    return "\n".join(paragraphs)
-
-
-def load_documents_texts(directory: Path, chunk_size: int = 2000) -> List[str]:
-    """
-    Проходит по папке и собирает список текстовых чанков.
-    Поддерживает .txt и .docx.
-    """
-    directory.mkdir(parents=True, exist_ok=True)
-    texts: List[str] = []
-
-    # Список файлов с расширением в порядке сортировки
-    files = sorted(directory.glob("*"))
-    for path in files:
-        if path.suffix.lower() == ".txt":
-            content = read_txt(path).strip()
-        elif path.suffix.lower() == ".docx":
-            content = read_docx(path).strip()
+def load_documents() -> List[str]:
+    """Загрузка только TXT документов"""
+    DOCS_DIR.mkdir(exist_ok=True)
+    texts = []
+    
+    # Только txt файлы
+    txt_files = sorted(DOCS_DIR.glob("*.txt"))
+    
+    logger.info(f"🔍 Найдено TXT файлов: {len(txt_files)}")
+    
+    for path in txt_files:
+        logger.info(f"📖 Чтение файла: {path.name}")
+        content = read_txt_file(path)
+        
+        if content:
+            # Разбиваем на абзацы и фильтруем короткие
+            paragraphs = [p.strip() for p in content.split('\n') if len(p.strip()) > 30]
+            texts.extend(paragraphs)
+            logger.info(f"✅ Добавлено {len(paragraphs)} абзацев из {path.name}")
         else:
-            # пропускаем неподдерживаемые расширения
-            continue
-
-        if not content:
-            continue
-
-        # Простая нарезка по символам (можно улучшить на sentences)
-        start = 0
-        n = len(content)
-        while start < n:
-            end = min(n, start + chunk_size)
-            chunk = content[start:end].strip()
-            if chunk and len(chunk) >= 30:  # пропускаем очень короткие куски
-                texts.append(chunk)
-            start = end
-
+            logger.warning(f"⚠️ Файл {path.name} пустой или не читается")
+    
     if not texts:
-        texts.append("Пример содержимого. Добавьте файлы .txt или .docx в папку documents для индексации.")
-    logger.info(f"Найдено {len(texts)} чанков в папке '{directory}'")
+        texts = [
+            "Добавьте .txt файлы в папку documents для поиска.",
+            "Файлы должны быть в кодировке UTF-8, CP1251 или Windows-1251.",
+            "Бот готов к работе, но нужны документы для поиска."
+        ]
+        logger.warning("⚠️ Используются демо-тексты, так как документы не найдены")
+    
+    logger.info(f"📊 Всего текстовых фрагментов: {len(texts)}")
     return texts
 
 
-# ---------- Embedding index (memmap-backed) ----------
-class SimpleEmbeddingIndex:
-    def __init__(self, model_name: str, device: str = "cpu"):
-        logger.info("Загружаем tokenizer и model (use_fast=False)...")
-        # use_fast=False для совместимости с окружениями без tokenizers
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
-        self.model = AutoModel.from_pretrained(model_name)
-        self.model.to(device)
-        self.device = device
-
-        self.texts: List[str] = []
-        self.emb_shape: Optional[tuple] = None  # (n, dim)
-        self.emb_path = EMB_PATH
-
-    @staticmethod
-    def mean_pooling(model_output, attention_mask):
-        token_embeddings = model_output.last_hidden_state
-        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
-        sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, dim=1)
-        sum_mask = torch.clamp(input_mask_expanded.sum(dim=1), min=1e-9)
-        return sum_embeddings / sum_mask
+class EmbeddingIndex:
+    def __init__(self):
+        logger.info("🤖 Загрузка модели для семантического поиска...")
+        self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+        self.model = AutoModel.from_pretrained(MODEL_NAME)
+        self.texts = []
 
     def encode_batch(self, texts_batch: List[str]) -> np.ndarray:
-        """Возвращает L2-normalized numpy array shape (batch, dim)"""
-        self.model.eval()
+        """Кодирование текстов в эмбеддинги"""
         with torch.no_grad():
             enc = self.tokenizer(
                 texts_batch,
@@ -136,166 +108,194 @@ class SimpleEmbeddingIndex:
                 max_length=512,
                 return_tensors="pt",
             )
-            input_ids = enc["input_ids"].to(self.device)
-            attention_mask = enc["attention_mask"].to(self.device)
-            out = self.model(input_ids=input_ids, attention_mask=attention_mask)
-            pooled = self.mean_pooling(out, attention_mask)
-            pooled = torch.nn.functional.normalize(pooled, p=2, dim=1)
-            arr = pooled.cpu().numpy().astype(np.float32)
-            # явное удаление тензоров
-            del enc, input_ids, attention_mask, out, pooled
-            return arr
+            outputs = self.model(**enc)
+            embeddings = self.mean_pooling(outputs, enc['attention_mask'])
+            embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
+            return embeddings.numpy().astype(np.float32)
 
-    def build_from_texts_memmap(self, texts: List[str], batch_size: int = 8):
-        """
-        Построение индекса с записью в numpy.memmap (embeddings.dat).
-        texts -> список строк (чанков)
-        """
+    @staticmethod
+    def mean_pooling(model_output, attention_mask):
+        token_embeddings = model_output.last_hidden_state
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+        sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
+        sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+        return sum_embeddings / sum_mask
+
+    def build_index(self, texts: List[str]):
+        """Построение поискового индекса"""
+        logger.info(f"🏗️ Начало построения индекса для {len(texts)} текстов...")
+        
+        self.texts = texts
         n = len(texts)
         dim = self.model.config.hidden_size
-        logger.info(f"Запускаем построение индекса: {n} текстов, dim={dim}")
-
-        # Создаём memmap
-        logger.info(f"Создаём memmap файл {self.emb_path} размера ({n}, {dim})")
-        mm = np.memmap(self.emb_path, dtype="float32", mode="w+", shape=(n, dim))
-
-        # Итерация по батчам и запись в memmap
-        for i in range(0, n, batch_size):
-            batch = texts[i : i + batch_size]
-            arr = self.encode_batch(batch)  # (b, dim)
-            mm[i : i + arr.shape[0], :] = arr
-            mm.flush()
-            logger.info(f"Записано батч {i}..{i+arr.shape[0]}")
-
-        # освобождаем memmap
-        del mm
-        # Сохраняем тексты в JSON и мета
-        with open(TEXTS_PATH, "w", encoding="utf-8") as f:
-            json.dump(texts, f, ensure_ascii=False)
-        meta = {"n": n, "dim": dim, "model_name": MODEL_NAME, "chunk_size": CHUNK_SIZE}
-        with open(META_PATH, "w", encoding="utf-8") as f:
-            json.dump(meta, f, ensure_ascii=False)
-        logger.info("Построение индекса завершено и сохранено на диск.")
+        
+        # Создаем memmap файл для эмбеддингов
+        embeddings = np.memmap(EMB_PATH, dtype=np.float32, mode='w+', shape=(n, dim))
+        
+        # Обрабатываем батчами с прогрессом
+        for i in range(0, n, BATCH_SIZE):
+            batch = texts[i:i + BATCH_SIZE]
+            batch_emb = self.encode_batch(batch)
+            embeddings[i:i + len(batch)] = batch_emb
+            
+            if i % (BATCH_SIZE * 5) == 0:  # Логируем каждые 5 батчей
+                logger.info(f"📦 Обработано {min(i + BATCH_SIZE, n)}/{n} текстов")
+        
+        embeddings.flush()
+        del embeddings
+        
+        # Сохраняем тексты и метаданные
+        with open(TEXTS_PATH, 'w', encoding='utf-8') as f:
+            json.dump(texts, f, ensure_ascii=False, indent=2)
+        
+        meta = {
+            "n_texts": n,
+            "dim": dim,
+            "model": MODEL_NAME
+        }
+        with open(META_PATH, 'w', encoding='utf-8') as f:
+            json.dump(meta, f, indent=2)
+        
+        logger.info("✅ Индекс успешно построен!")
 
     def load_index(self):
-        """
-        Загружает индекс (texts.json + embeddings.dat) в объект:
-        texts -> list, embeddings -> numpy.memmap (r)
-        """
-        if not TEXTS_PATH.exists() or not self.emb_path.exists() or not META_PATH.exists():
-            raise FileNotFoundError("Индекс не найден на диске.")
-        with open(TEXTS_PATH, "r", encoding="utf-8") as f:
+        """Загрузка индекса с диска"""
+        if not TEXTS_PATH.exists():
+            raise FileNotFoundError("Файл texts.json не найден")
+        
+        with open(TEXTS_PATH, 'r', encoding='utf-8') as f:
             self.texts = json.load(f)
-        with open(META_PATH, "r", encoding="utf-8") as f:
+        
+        with open(META_PATH, 'r', encoding='utf-8') as f:
             meta = json.load(f)
-        n = meta["n"]
+        
+        n = meta["n_texts"]
         dim = meta["dim"]
-        # открываем memmap в режиме чтения
-        emb = np.memmap(self.emb_path, dtype="float32", mode="r", shape=(n, dim))
-        self.emb_shape = (n, dim)
-        logger.info(f"Индекс загружен: {n} embeddings, dim={dim}")
-        return emb
+        embeddings = np.memmap(EMB_PATH, dtype=np.float32, mode='r', shape=(n, dim))
+        
+        logger.info(f"📂 Индекс загружен: {n} текстовых фрагментов")
+        return embeddings
 
-    def search(self, query: str, top_k: int = 3, emb_memmap: Optional[np.memmap] = None):
-        """
-        Поиск: q -> encode -> dot(embs, q)
-        emb_memmap можно передать, чтобы не загружать внутри
-        """
-        if emb_memmap is None:
-            if not self.emb_path.exists():
-                return []
-            # Загружаем memmap
-            with open(META_PATH, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-            n, dim = meta["n"], meta["dim"]
-            emb_memmap = np.memmap(self.emb_path, dtype="float32", mode="r", shape=(n, dim))
-        # вычисляем эмбед для запроса
-        q_emb = self.encode_batch([query])[0]  # shape (dim,)
-        # cosine similarity since stored vectors are normalized
-        sims = emb_memmap @ q_emb  # shape (n,)
-        if sims.size == 0:
+    def search(self, query: str, top_k: int = 5):
+        """Семантический поиск по индексу"""
+        if not self.texts:
             return []
-        # топ-k через argpartition (быстрее, чем argsort для больших n)
-        if top_k >= sims.size:
-            idx = np.argsort(-sims)
+        
+        embeddings = self.load_index()
+        query_emb = self.encode_batch([query])[0]
+        
+        # Вычисляем косинусное сходство
+        scores = embeddings @ query_emb
+        
+        # Находим топ-K результатов
+        if top_k >= len(scores):
+            top_indices = np.argsort(-scores)
         else:
-            part = np.argpartition(-sims, top_k - 1)[:top_k]
-            idx = part[np.argsort(-sims[part])]
-        results = [(int(i), float(sims[i])) for i in idx[:top_k]]
+            top_indices = np.argpartition(-scores, top_k)[:top_k]
+            top_indices = top_indices[np.argsort(-scores[top_indices])]
+        
+        results = []
+        for idx in top_indices:
+            if scores[idx] > 0.1:  # Минимальный порог сходства
+                results.append((int(idx), float(scores[idx])))
+        
         return results
 
 
-# ---------- Bot logic ----------
 class BotApp:
     def __init__(self):
-        self.index = SimpleEmbeddingIndex(MODEL_NAME, device=EMBED_DEVICE)
-        self.emb_memmap: Optional[np.memmap] = None
-        # Попробуем загрузить индекс с диска; если нет — построим
+        self.index = None
+        self.is_ready = False
+        self.init_bot()
+
+    def init_bot(self):
+        """Инициализация бота с принудительной переиндексацией"""
         try:
-            self.emb_memmap = self.index.load_index()
-            # texts загружены внутри load_index
+            logger.info("🚀 Инициализация Telegram бота...")
+            
+            # Всегда перестраиваем индекс
+            texts = load_documents()
+            self.index = EmbeddingIndex()
+            self.index.build_index(texts)
+            
+            self.is_ready = True
+            logger.info("✅ Бот успешно инициализирован и готов к работе!")
+            
         except Exception as e:
-            logger.info(f"Индекс не найден или не загружен: {e}. Будем строить заново.")
-            # Загружаем тексты из документов
-            texts = load_documents_texts(DOCS_DIR, chunk_size=CHUNK_SIZE)
-            # Построение индекса (будет записан в файлы)
-            self.index.build_from_texts_memmap(texts, batch_size=BATCH_SIZE)
-            # После построения — загрузим memmap и texts
-            self.emb_memmap = self.index.load_index()
+            logger.error(f"❌ Критическая ошибка инициализации: {e}")
+            self.is_ready = False
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self.is_ready:
+            await update.message.reply_text("🔄 Бот还在初始化，请稍候...")
+            return
+            
         await update.message.reply_text(
-            "Бот запущен. Отправь вопрос — я найду похожие фрагменты.\nКоманда /reload — переиндексировать документы."
+            "🤖 *Бот готов к работе!*\n\n"
+            "Отправьте мне вопрос или фразу для поиска по документам.\n"
+            "Я найду наиболее релевантные фрагменты текста.\n\n"
+            "_Используется семантический поиск на основе нейросетей_",
+            parse_mode='Markdown'
         )
 
-    async def reload_docs(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("Начинаю переиндексацию... Это может занять время.")
-        # перестроим индекс (в главном потоке — может занять несколько минут)
-        texts = load_documents_texts(DOCS_DIR, chunk_size=CHUNK_SIZE)
-        self.index.build_from_texts_memmap(texts, batch_size=BATCH_SIZE)
-        self.emb_memmap = self.index.load_index()
-        await update.message.reply_text(f"Документы переиндексированы. Фрагментов: {len(self.index.texts)}")
-
-    async def handle_msg(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        text = (update.message.text or "").strip()
-        if not text:
-            await update.message.reply_text("Пустое сообщение — пришли текст вопроса.")
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self.is_ready:
+            await update.message.reply_text("⏳ Бот还在 загрузки，请稍等...")
             return
-        if self.emb_memmap is None:
-            await update.message.reply_text("Индекс недоступен. Запросите /reload.")
+            
+        query = update.message.text.strip()
+        if not query:
+            await update.message.reply_text("📝 Введите текст для поиска")
             return
-        results = self.index.search(text, top_k=TOP_K, emb_memmap=self.emb_memmap)
-        if not results:
-            await update.message.reply_text("Ничего не найдено.")
-            return
-        reply_lines = []
-        for idx, score in results:
-            snippet = self.index.texts[idx]
-            score_s = f"{score:.4f}"
-            snippet_short = snippet if len(snippet) <= 800 else snippet[:800] + "..."
-            reply_lines.append(f"#{idx} (sim={score_s}):\n{snippet_short}\n")
-        # Если сообщение длинное, отправляем частями
-        reply = "\n\n".join(reply_lines)
-        if len(reply) <= 4000:
-            await update.message.reply_text(reply)
-        else:
-            # разбиваем на части до 4000 символов
-            for i in range(0, len(reply), 3800):
-                await update.message.reply_text(reply[i : i + 3800])
+            
+        try:
+            logger.info(f"🔍 Поиск запроса: {query}")
+            results = self.index.search(query, TOP_K)
+            
+            if not results:
+                await update.message.reply_text(
+                    "❌ По вашему запросу ничего не найдено.\n"
+                    "Попробуйте переформулировать вопрос или проверьте наличие документов."
+                )
+                return
+                
+            response = "📄 *Результаты поиска:*\n\n"
+            for i, (idx, score) in enumerate(results, 1):
+                snippet = self.index.texts[idx]
+                response += f"*{i}.* Сходство: `{score:.3f}`\n"
+                response += f"{snippet}\n\n"
+                
+            # Обрезаем если слишком длинное сообщение
+            if len(response) > 4000:
+                response = response[:4000] + "\n\n... (сообщение обрезано)"
+                
+            await update.message.reply_text(response, parse_mode='Markdown')
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка при поиске: {e}")
+            await update.message.reply_text(
+                "⚠️ Произошла ошибка при поиске. Попробуйте еще раз или перезапустите бота командой /start"
+            )
 
 
-# ---------- Entrypoint ----------
 def main():
-    app_logic = BotApp()
-    application = ApplicationBuilder().token(TOKEN).build()
-
-    application.add_handler(CommandHandler("start", app_logic.start))
-    application.add_handler(CommandHandler("reload", app_logic.reload_docs))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, app_logic.handle_msg))
-
-    logger.info("Запуск бота в polling режиме (для Hugging Face Spaces).")
-    # polling — проще на Spaces (не нужен webhook/порт)
-    application.run_polling()
+    """Основная функция запуска бота"""
+    logger.info("🎯 Запуск Telegram бота...")
+    
+    try:
+        bot_app = BotApp()
+        application = ApplicationBuilder().token(TOKEN).build()
+        
+        # Регистрируем обработчики
+        application.add_handler(CommandHandler("start", bot_app.start))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot_app.handle_message))
+        
+        logger.info("✅ Бот запущен в режиме polling")
+        application.run_polling()
+        
+    except Exception as e:
+        logger.critical(f"💥 Критическая ошибка при запуске бота: {e}")
+        raise
 
 
 if __name__ == "__main__":
